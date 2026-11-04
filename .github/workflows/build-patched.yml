@@ -43,22 +43,23 @@ jobs:
           cat > /tmp/clashbar-fix.patch <<'CLASHBAR_PATCH_EOF'
           --- a/Sources/ClashBar/Services/ConfigService.swift
           +++ b/Sources/ClashBar/Services/ConfigService.swift
-          @@ -260,44 +260,87 @@
-                   guard let scheme = url.scheme?.lowercased() else { return false }
+          @@ -261,41 +261,112 @@
                    return scheme == "http" || scheme == "https"
                }
-          +
-          +    // Some subscription converters branch on User-Agent: they stall or return an error page
-          +    // for clash.meta/* but serve a valid Clash YAML to other clients. Retry once with a
-          +    // widely accepted UA so a single incompatible backend does not break the import flow.
-          +    private static let compatibleSubscriptionUserAgent = "clash-verge"
            
+          +    // Subscription converters commonly branch on User-Agent: many of them generate a Clash
+          +    // YAML only for known Clash clients, and answer other UAs with a base64 node list, a 502,
+          +    // or nothing at all. They can also be slow (10s+ for a few thousand rules) or flaky, which
+          +    // used to surface as "request timed out" / "not a valid Clash configuration".
+          +    private static let fallbackSubscriptionUserAgents = ["clash-verge", "clash.meta/1.19.0"]
+          +    private static let subscriptionDownloadAttempts = 2
+          +
                func downloadRemoteConfigData(from remoteURL: URL, userAgent: String? = nil) async throws -> Data {
                    let session = URLSessionFactory.makeEphemeralSession(options: .init(
           -            timeoutIntervalForRequest: 15,
           -            timeoutIntervalForResource: 30))
-          +            timeoutIntervalForRequest: 30,
-          +            timeoutIntervalForResource: 60))
+          +            timeoutIntervalForRequest: 60,
+          +            timeoutIntervalForResource: 180))
                    defer { session.finishTasksAndInvalidate() }
            
           -        var request = URLRequest(url: remoteURL)
@@ -70,8 +71,8 @@ jobs:
           +                candidates.append(trimmed)
                        }
                    }
-          +        if !candidates.contains(Self.compatibleSubscriptionUserAgent) {
-          +            candidates.append(Self.compatibleSubscriptionUserAgent)
+          +        for agent in Self.fallbackSubscriptionUserAgents where !candidates.contains(agent) {
+          +            candidates.append(agent)
           +        }
            
           -        let (bytes, response) = try await session.bytes(for: request)
@@ -80,19 +81,26 @@ jobs:
           +            code: 500,
           +            userInfo: [NSLocalizedDescriptionKey: "Remote config download failed"])
           +
-          +        for agent in candidates {
-          +            do {
-          +                let data = try await self.fetchRemoteConfigData(
-          +                    from: remoteURL,
-          +                    userAgent: agent,
-          +                    session: session)
-          +                guard self.validateClashConfigData(data) else {
-          +                    lastError = self.invalidRemoteConfigResponseError(data)
-          +                    continue
+          +        for attempt in 1...Self.subscriptionDownloadAttempts {
+          +            for agent in candidates {
+          +                do {
+          +                    let data = try await self.fetchRemoteConfigData(
+          +                        from: remoteURL,
+          +                        userAgent: agent,
+          +                        session: session)
+          +                    guard self.validateClashConfigData(data) else {
+          +                        lastError = self.invalidRemoteConfigResponseError(data)
+          +                        continue
+          +                    }
+          +                    return data
+          +                } catch {
+          +                    lastError = error
           +                }
-          +                return data
-          +            } catch {
-          +                lastError = error
+          +            }
+          +            if attempt < Self.subscriptionDownloadAttempts {
+          +                // The converter backend behind a subscription link is often rate limited or
+          +                // still generating; give it a moment before the second round.
+          +                try? await Task.sleep(nanoseconds: 2_000_000_000)
           +            }
           +        }
           +
@@ -121,7 +129,9 @@ jobs:
           +        guard data.count <= self.maxRemoteConfigBytes else {
                        throw self.remoteConfigTooLargeError(limit: self.maxRemoteConfigBytes)
                    }
-          -
+          +        return data
+          +    }
+           
           -        var data = Data()
           -        data.reserveCapacity(min(self.maxRemoteConfigBytes, 64 * 1024))
           -        for try await byte in bytes {
@@ -129,24 +139,38 @@ jobs:
           -                throw self.remoteConfigTooLargeError(limit: self.maxRemoteConfigBytes)
           -            }
           -            data.append(byte)
-          -        }
-                   return data
-               }
-           
           +    private func invalidRemoteConfigResponseError(_ data: Data) -> NSError {
           +        let preview = String(data: data.prefix(160), encoding: .utf8) ?? "<binary data>"
+          +        let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+          +
+          +        // A very common shape: the backend ignored the requested format and returned the
+          +        // base64 encoded node list used by v2rayN / Shadowrocket. Say so explicitly instead
+          +        // of reporting a generic "not a Clash configuration".
+          +        if let decoded = Data(base64Encoded: data, options: .ignoreUnknownCharacters),
+          +           let text = String(data: decoded.prefix(2048), encoding: .utf8),
+          +           text.contains("://")
+          +        {
+          +            return NSError(
+          +                domain: "ClashBar.ConfigImport",
+          +                code: 422,
+          +                userInfo: [NSLocalizedDescriptionKey: """
+          +                The subscription returned a base64 node list (v2ray / Shadowrocket format) \
+          +                instead of a Clash YAML. Make sure the link ends with a Clash target \
+          +                (for example append &target=clash). Preview: \(trimmed)
+          +                """])
+                   }
+          -        return data
+          +
           +        return NSError(
           +            domain: "ClashBar.ConfigImport",
           +            code: 422,
           +            userInfo: [NSLocalizedDescriptionKey: """
           +            Remote config is not a Clash YAML (the subscription backend may have rejected \
-          +            this User-Agent). Content preview: \(preview)
+          +            this User-Agent). Content preview: \(trimmed)
           +            """])
-          +    }
-          +
+               }
+           
                private func remoteConfigTooLargeError(limit: Int) -> NSError {
-                   NSError(
-                       domain: "ClashBar.ConfigImport",
           --- a/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
           @@ -7,7 +7,10 @@

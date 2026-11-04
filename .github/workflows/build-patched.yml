@@ -6,11 +6,6 @@ on:
       - '**'
   workflow_dispatch:
     inputs:
-      source_ref:
-        description: 'Source ref to build. The embedded patch targets v0.3.6.'
-        required: false
-        default: 'v0.3.6'
-        type: string
       bundle_core:
         description: 'Bundle mihomo core (1 = full build, 0 = smaller no-core build)'
         required: false
@@ -31,10 +26,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout source
+      - name: Checkout upstream v0.3.6 source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'v0.3.6' }}
+          repository: Sitoi/ClashBar
+          ref: v0.3.6
 
       - name: Write and apply remote-import fix
         shell: bash
@@ -219,7 +215,7 @@ jobs:
             echo "Patch already present in this tree; skipping."
           else
             echo "Embedded patch does not match this source ref." >&2
-            echo "Set source_ref to v0.3.6 (or the matching tag) when dispatching." >&2
+            echo "The embedded patch targets upstream Sitoi/ClashBar v0.3.6." >&2
             exit 1
           fi
 

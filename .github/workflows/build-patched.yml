@@ -1,0 +1,273 @@
+name: Build patched ClashBar (arm64)
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source ref to build. The embedded patch targets v0.3.6.'
+        required: false
+        default: 'v0.3.6'
+        type: string
+      bundle_core:
+        description: 'Bundle mihomo core (1 = full build, 0 = smaller no-core build)'
+        required: false
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
+      dmg_suffix:
+        description: 'Suffix used in the DMG filename'
+        required: false
+        default: 'apple-silicon-patched'
+        type: string
+
+jobs:
+  build-arm64:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'v0.3.6' }}
+
+      - name: Write and apply remote-import fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git --version
+          git log -1 --format='Building from %h %s'
+          cat > /tmp/clashbar-fix.patch <<'CLASHBAR_PATCH_EOF'
+          --- a/Sources/ClashBar/Services/ConfigService.swift
+          +++ b/Sources/ClashBar/Services/ConfigService.swift
+          @@ -260,44 +260,87 @@
+                   guard let scheme = url.scheme?.lowercased() else { return false }
+                   return scheme == "http" || scheme == "https"
+               }
+          +
+          +    // Some subscription converters branch on User-Agent: they stall or return an error page
+          +    // for clash.meta/* but serve a valid Clash YAML to other clients. Retry once with a
+          +    // widely accepted UA so a single incompatible backend does not break the import flow.
+          +    private static let compatibleSubscriptionUserAgent = "clash-verge"
+           
+               func downloadRemoteConfigData(from remoteURL: URL, userAgent: String? = nil) async throws -> Data {
+                   let session = URLSessionFactory.makeEphemeralSession(options: .init(
+          -            timeoutIntervalForRequest: 15,
+          -            timeoutIntervalForResource: 30))
+          +            timeoutIntervalForRequest: 30,
+          +            timeoutIntervalForResource: 60))
+                   defer { session.finishTasksAndInvalidate() }
+           
+          -        var request = URLRequest(url: remoteURL)
+          +        var candidates: [String] = []
+                   if let userAgent {
+                       let trimmed = userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+                       if !trimmed.isEmpty {
+          -                request.setValue(trimmed, forHTTPHeaderField: "User-Agent")
+          +                candidates.append(trimmed)
+                       }
+                   }
+          +        if !candidates.contains(Self.compatibleSubscriptionUserAgent) {
+          +            candidates.append(Self.compatibleSubscriptionUserAgent)
+          +        }
+           
+          -        let (bytes, response) = try await session.bytes(for: request)
+          +        var lastError: Error = NSError(
+          +            domain: "ClashBar.ConfigImport",
+          +            code: 500,
+          +            userInfo: [NSLocalizedDescriptionKey: "Remote config download failed"])
+          +
+          +        for agent in candidates {
+          +            do {
+          +                let data = try await self.fetchRemoteConfigData(
+          +                    from: remoteURL,
+          +                    userAgent: agent,
+          +                    session: session)
+          +                guard self.validateClashConfigData(data) else {
+          +                    lastError = self.invalidRemoteConfigResponseError(data)
+          +                    continue
+          +                }
+          +                return data
+          +            } catch {
+          +                lastError = error
+          +            }
+          +        }
+          +
+          +        throw lastError
+          +    }
+          +
+          +    private func fetchRemoteConfigData(
+          +        from remoteURL: URL,
+          +        userAgent: String,
+          +        session: URLSession) async throws -> Data
+          +    {
+          +        var request = URLRequest(url: remoteURL)
+          +        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+          +
+          +        // Read the whole body at once. Iterating session.bytes byte-by-byte on a large
+          +        // subscription (~700 KB) is slow enough to trip the request timeout.
+          +        let (data, response) = try await session.data(for: request)
+                   guard let http = response as? HTTPURLResponse else {
+                       throw APIError.invalidResponse
+                   }
+                   guard 200..<300 ~= http.statusCode else {
+                       throw APIError.statusCode(http.statusCode, HTTPURLResponse.localizedString(forStatusCode: http.statusCode))
+                   }
+          -
+          -        if http.expectedContentLength > Int64(self.maxRemoteConfigBytes) {
+          +        guard data.count <= self.maxRemoteConfigBytes else {
+                       throw self.remoteConfigTooLargeError(limit: self.maxRemoteConfigBytes)
+                   }
+          -
+          -        var data = Data()
+          -        data.reserveCapacity(min(self.maxRemoteConfigBytes, 64 * 1024))
+          -        for try await byte in bytes {
+          -            if data.count >= self.maxRemoteConfigBytes {
+          -                throw self.remoteConfigTooLargeError(limit: self.maxRemoteConfigBytes)
+          -            }
+          -            data.append(byte)
+          -        }
+                   return data
+               }
+           
+          +    private func invalidRemoteConfigResponseError(_ data: Data) -> NSError {
+          +        let preview = String(data: data.prefix(160), encoding: .utf8) ?? "<binary data>"
+          +        return NSError(
+          +            domain: "ClashBar.ConfigImport",
+          +            code: 422,
+          +            userInfo: [NSLocalizedDescriptionKey: """
+          +            Remote config is not a Clash YAML (the subscription backend may have rejected \
+          +            this User-Agent). Content preview: \(preview)
+          +            """])
+          +    }
+          +
+               private func remoteConfigTooLargeError(limit: Int) -> NSError {
+                   NSError(
+                       domain: "ClashBar.ConfigImport",
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
+          @@ -7,7 +7,10 @@
+               }
+           
+               func configureModalWindow(_ window: NSWindow) {
+          -        window.level = .statusBar
+          +        // The side-attached menu panel is also .statusBar. A modal alert at the same level
+          +        // can end up behind it: the modal run loop then owns all events while the user cannot
+          +        // see or dismiss the alert, which looks like the whole menu being frozen.
+          +        window.level = .popUpMenu
+                   window.collectionBehavior.insert(.moveToActiveSpace)
+               }
+           
+          @@ -17,6 +20,7 @@
+                   message: String,
+                   informative: String,
+                   buttons: [String],
+          +        autoDismissAfter seconds: TimeInterval? = nil,
+                   configure: ((NSAlert) -> Void)? = nil) -> NSApplication.ModalResponse
+               {
+                   let alert = NSAlert()
+          @@ -29,6 +33,19 @@
+                   configure?(alert)
+                   self.prepareModalWindowPresentation()
+                   self.configureModalWindow(alert.window)
+          +
+          +        // Safety net: never let a result alert hold the modal loop forever. Input dialogs
+          +        // keep the default (nil) so users have unlimited time to type a URL.
+          +        if let seconds, seconds > 0 {
+          +            let token = ObjectIdentifier(alert.window)
+          +            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+          +                MainActor.assumeIsolated {
+          +                    guard let modal = NSApp.modalWindow, ObjectIdentifier(modal) == token else { return }
+          +                    NSApp.stopModal(withCode: NSApplication.ModalResponse.cancel)
+          +                }
+          +            }
+          +        }
+          +
+                   return alert.runModal()
+               }
+           }
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
+          @@ -388,13 +388,16 @@
+               }
+           
+               private func presentRemoteConfigImportResultAlert(success: Bool, message: String) {
+          +        // Result alerts are informational only. Cap the modal loop so a failed import
+          +        // can never leave the menu unresponsive if the alert is hidden or loses focus.
+                   self.runModalAlert(
+                       style: success ? .informational : .warning,
+                       message: success
+                           ? tr("app.config.remote_import.alert.success.title")
+                           : tr("app.config.remote_import.alert.failure.title"),
+                       informative: message,
+          -            buttons: [tr("ui.action.ok")])
+          +            buttons: [tr("ui.action.ok")],
+          +            autoDismissAfter: 20)
+               }
+           
+               private struct RemoteConfigImportInput {
+          CLASHBAR_PATCH_EOF
+          if git apply --check /tmp/clashbar-fix.patch 2>/dev/null; then
+            git apply --verbose /tmp/clashbar-fix.patch
+            echo "Embedded patch applied."
+          elif git apply --check -R /tmp/clashbar-fix.patch 2>/dev/null; then
+            echo "Patch already present in this tree; skipping."
+          else
+            echo "Embedded patch does not match this source ref." >&2
+            echo "Set source_ref to v0.3.6 (or the matching tag) when dispatching." >&2
+            exit 1
+          fi
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Verify Swift toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+          if ! swift --version | grep -Eq 'Swift version (6\.[2-9]|[7-9]\.)'; then
+            echo "Swift 6.2+ is required by Package.swift." >&2
+            exit 1
+          fi
+
+      - name: Build app (arm64)
+        shell: bash
+        env:
+          APP_VERSION: 0.3.6
+          BUILD_NUMBER: 1
+          TARGET_ARCH: arm64
+          PREPARE_MIHOMO_BINARY: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_core || '1' }}
+          BUNDLE_MIHOMO_BINARY: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_core || '1' }}
+        run: ./Scripts/build.sh app
+
+      - name: Build DMG
+        shell: bash
+        env:
+          APP_VERSION: 0.3.6
+          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched' }}
+        run: ./Scripts/build.sh dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashBar-patched-dmg
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          if-no-files-found: error
+
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashBar-patched-app
+          path: dist/ClashBar.app/
+          if-no-files-found: error

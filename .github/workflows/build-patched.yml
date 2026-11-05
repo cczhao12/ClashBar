@@ -19,7 +19,7 @@ on:
       dmg_suffix:
         description: 'Suffix used in the DMG filename'
         required: false
-        default: 'apple-silicon-patched3'
+        default: 'apple-silicon-patched4'
         type: string
 
 jobs:
@@ -372,14 +372,28 @@ jobs:
                    }
                }
            
-          @@ -116,3 +190,248 @@
+          @@ -114,5 +188,281 @@
+                   guard self.shouldDeferAutoStartForMissingManagedCore() else { return false }
+                   guard !defaults.bool(forKey: initialNoCoreSetupGuideShownKey) else { return false }
                    return true
-               }
-           }
+          +    }
+          +}
+          +
+          +/// The window used for alerts.
+          +///
+          +/// Must be an `NSPanel`: `ClashBarAppDelegate.suppressWindowIfNeeded` closes every plain
+          +/// `NSWindow` that is not a status-bar/popover window, and it runs on
+          +/// `NSWindow.didBecomeKeyNotification`. A plain `NSWindow` alert therefore vanished the moment
+          +/// the user clicked it (that click is what makes it key). Panels are skipped by that filter, and
+          +/// the class name still contains "Alert" so the name-based fallback also accepts it.
+          +final class AlertPanel: NSPanel {
+          +    override var canBecomeKey: Bool { true }
+          +    override var canBecomeMain: Bool { false }
+          +}
           +
           +/// Owns the alert window and keeps the calling task suspended until the user answers.
           +///
-          +/// Deliberately built on a plain `NSWindow` plus buttons instead of `NSAlert.runModal()`: there
+          +/// Deliberately built on a plain window plus buttons instead of `NSAlert.runModal()`: there
           +/// is no modal event loop, so a window that fails to appear can no longer freeze the app, and
           +/// nothing can nest inside a stuck modal session.
           +@MainActor
@@ -389,6 +403,7 @@ jobs:
           +    private var window: NSWindow?
           +    private var continuation: CheckedContinuation<NSApplication.ModalResponse, Never>?
           +    private var autoDismissWorkItem: DispatchWorkItem?
+          +    private var closeObserver: NSObjectProtocol?
           +
           +    func present(
           +        style: NSAlert.Style,
@@ -457,7 +472,7 @@ jobs:
           +            + effectiveAccessoryGap + accessoryHeight
           +            + buttonsGap + buttonsHeight + padding
           +
-          +        let window = NSWindow(
+          +        let window = AlertPanel(
           +            contentRect: NSRect(x: 0, y: 0, width: width, height: contentHeight),
           +            styleMask: [.titled, .closable],
           +            backing: .buffered,
@@ -467,6 +482,7 @@ jobs:
           +        window.level = level
           +        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
           +        window.hidesOnDeactivate = false
+          +        window.becomesKeyOnlyIfNeeded = false
           +
           +        // Route the title-bar close button to our own handler so the pending continuation is
           +        // always resumed; without this the window would close while a task waits forever.
@@ -547,6 +563,18 @@ jobs:
           +        window.makeKeyAndOrderFront(nil)
           +        window.orderFrontRegardless()
           +
+          +        // Anything that closes the window behind our back (Cmd-W, AppKit close) must resume the
+          +        // waiting task, otherwise the import flow would silently never finish.
+          +        self.closeObserver = NotificationCenter.default.addObserver(
+          +            forName: NSWindow.willCloseNotification,
+          +            object: window,
+          +            queue: .main)
+          +        { [weak self] _ in
+          +            MainActor.assumeIsolated {
+          +                self?.finish(.abort)
+          +            }
+          +        }
+          +
           +        if let seconds, seconds > 0 {
           +            let workItem = DispatchWorkItem { [weak self] in
           +                MainActor.assumeIsolated {
@@ -567,7 +595,7 @@ jobs:
           +                self.finish(.abort)
           +            }
           +        }
-          +    }
+               }
           +
           +    @objc private func alertButtonPressed(_ sender: NSButton) {
           +        let response = NSApplication.ModalResponse(
@@ -585,6 +613,11 @@ jobs:
           +
           +        self.autoDismissWorkItem?.cancel()
           +        self.autoDismissWorkItem = nil
+          +
+          +        if let closeObserver = self.closeObserver {
+          +            NotificationCenter.default.removeObserver(closeObserver)
+          +            self.closeObserver = nil
+          +        }
           +
           +        window.orderOut(nil)
           +
@@ -620,7 +653,7 @@ jobs:
           +            attributes: attributes)
           +        return ceil(rect.height) + 1
           +    }
-          +}
+           }
           --- a/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
           @@ -9,7 +9,7 @@
@@ -808,7 +841,7 @@ jobs:
         shell: bash
         env:
           APP_VERSION: 0.3.6
-          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched3' }}
+          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched4' }}
         run: ./Scripts/build.sh dmg
 
       - name: Upload DMG

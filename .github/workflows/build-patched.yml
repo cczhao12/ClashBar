@@ -19,7 +19,7 @@ on:
       dmg_suffix:
         description: 'Suffix used in the DMG filename'
         required: false
-        default: 'apple-silicon-patched2'
+        default: 'apple-silicon-patched3'
         type: string
 
 jobs:
@@ -240,7 +240,7 @@ jobs:
                }
            }
            
-          @@ -52,11 +72,13 @@
+          @@ -52,11 +72,17 @@
                    self.lastCoreFailureAlertKey = dedupeKey
                    self.lastCoreFailureAlertAt = now
            
@@ -249,17 +249,21 @@ jobs:
           -            message: title,
           -            informative: message,
           -            buttons: [tr("ui.action.ok")])
+          +        // Resolve localized strings before entering the task: inside a `[weak self]` closure
+          +        // `self` is optional, so instance members must be referenced as `self?.` there.
+          +        let okTitle = self.tr("ui.action.ok")
+          +
           +        Task { [weak self] in
           +            _ = await self?.presentAlert(
           +                style: style,
           +                message: title,
           +                informative: message,
-          +                buttons: [tr("ui.action.ok")])
+          +                buttons: [okTitle])
           +        }
                }
            
                func presentConfigValidationFailedAlert(fileName: String, details: String) {
-          @@ -67,20 +89,25 @@
+          @@ -67,20 +93,25 @@
                        informativeParts.append(tr("app.config.validation_failed.hint.geo"))
                    }
                    informativeParts.append(tr("app.config.validation_failed.hint.common"))
@@ -297,7 +301,7 @@ jobs:
                    }
                }
            
-          @@ -93,6 +120,42 @@
+          @@ -93,6 +124,42 @@
                    return needles.contains { lower.contains($0) }
                }
            
@@ -340,7 +344,7 @@ jobs:
                func presentInitialNoCoreSetupGuideIfNeeded() {
                    guard self.shouldPresentInitialNoCoreSetupGuide() else { return }
                    guard !didPresentInitialNoCoreSetupGuide else { return }
-          @@ -100,13 +163,20 @@
+          @@ -100,13 +167,20 @@
                    didPresentInitialNoCoreSetupGuide = true
                    defaults.set(true, forKey: initialNoCoreSetupGuideShownKey)
            
@@ -368,7 +372,7 @@ jobs:
                    }
                }
            
-          @@ -116,3 +186,248 @@
+          @@ -116,3 +190,248 @@
                    return true
                }
            }
@@ -668,7 +672,7 @@ jobs:
                        style: .warning,
                        message: tr("app.config.import.overwrite.title", fileName),
                        informative: tr("app.config.import.overwrite.message"),
-          @@ -388,13 +388,21 @@
+          @@ -388,13 +388,24 @@
                }
            
                private func presentRemoteConfigImportResultAlert(success: Bool, message: String) {
@@ -686,18 +690,21 @@ jobs:
           +            ? tr("app.config.remote_import.alert.success.title")
           +            : tr("app.config.remote_import.alert.failure.title")
           +
+          +        // `self` is optional inside the task, so the localized title is resolved up front.
+          +        let okTitle = self.tr("ui.action.ok")
+          +
           +        Task { [weak self] in
           +            _ = await self?.presentAlert(
           +                style: style,
           +                message: title,
           +                informative: message,
-          +                buttons: [tr("ui.action.ok")],
+          +                buttons: [okTitle],
           +                autoDismissAfter: 20)
           +        }
                }
            
                private struct RemoteConfigImportInput {
-          @@ -404,7 +412,7 @@
+          @@ -404,7 +415,7 @@
                    let autoUpdateIntervalHours: Int
                }
            
@@ -706,7 +713,7 @@ jobs:
                    let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 142))
            
                    let urlLabel = NSTextField(labelWithString: tr("ui.quick.remote.url_label"))
-          @@ -455,11 +463,12 @@
+          @@ -455,11 +466,12 @@
                    container.addSubview(intervalField)
                    container.addSubview(intervalUnit)
            
@@ -801,7 +808,7 @@ jobs:
         shell: bash
         env:
           APP_VERSION: 0.3.6
-          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched2' }}
+          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched3' }}
         run: ./Scripts/build.sh dmg
 
       - name: Upload DMG

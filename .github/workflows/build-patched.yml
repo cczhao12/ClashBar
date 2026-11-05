@@ -19,7 +19,7 @@ on:
       dmg_suffix:
         description: 'Suffix used in the DMG filename'
         required: false
-        default: 'apple-silicon-patched'
+        default: 'apple-silicon-patched2'
         type: string
 
 jobs:
@@ -173,66 +173,592 @@ jobs:
                private func remoteConfigTooLargeError(limit: Int) -> NSError {
           --- a/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
-          @@ -7,7 +7,10 @@
+          @@ -3,33 +3,53 @@
+           @MainActor
+           extension AppViewModel {
+               func prepareModalWindowPresentation() {
+          +        // A menu-bar-only app is usually inactive (and can even be hidden) while its panel is
+          +        // open. Without this the alert window can be created but never ordered in front, which
+          +        // is exactly the "no dialog, app frozen" state users hit before.
+          +        if NSApp.isHidden {
+          +            NSApp.unhide(nil)
+          +        }
+                   NSApp.activate(ignoringOtherApps: true)
                }
            
+          +    /// Above the status item panel (25) so an open menu can never cover the alert, but below
+          +    /// the system menu levels. NSAlert resets its own level inside `runModal`, which is why the
+          +    /// previous fix could not work: alerts are now presented by our own plain window instead.
+          +    static var alertWindowLevel: NSWindow.Level {
+          +        NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+          +    }
+          +
                func configureModalWindow(_ window: NSWindow) {
           -        window.level = .statusBar
-          +        // The side-attached menu panel is also .statusBar. A modal alert at the same level
-          +        // can end up behind it: the modal run loop then owns all events while the user cannot
-          +        // see or dismiss the alert, which looks like the whole menu being frozen.
-          +        window.level = .popUpMenu
+          +        window.level = Self.alertWindowLevel
                    window.collectionBehavior.insert(.moveToActiveSpace)
+          +        window.hidesOnDeactivate = false
                }
            
-          @@ -17,6 +20,7 @@
+          +    /// Non-blocking replacement for `NSAlert.runModal()`.
+          +    ///
+          +    /// The old implementation parked the main thread inside a modal event loop. If the alert
+          +    /// window was hidden behind the status panel (or ordered out by a stray click) the loop kept
+          +    /// running with nothing on screen: the app looked frozen and any later alert nested inside
+          +    /// the stuck session. This version never blocks — it shows a normal window and suspends the
+          +    /// calling task until a button is pressed or the window closes.
+               @discardableResult
+          -    func runModalAlert(
+          +    func presentAlert(
+                   style: NSAlert.Style,
                    message: String,
                    informative: String,
                    buttons: [String],
-          +        autoDismissAfter seconds: TimeInterval? = nil,
-                   configure: ((NSAlert) -> Void)? = nil) -> NSApplication.ModalResponse
+          -        configure: ((NSAlert) -> Void)? = nil) -> NSApplication.ModalResponse
+          +        accessory: NSView? = nil,
+          +        autoDismissAfter seconds: TimeInterval? = nil) async -> NSApplication.ModalResponse
                {
-                   let alert = NSAlert()
-          @@ -29,6 +33,19 @@
-                   configure?(alert)
+          -        let alert = NSAlert()
+          -        alert.alertStyle = style
+          -        alert.messageText = message
+          -        alert.informativeText = informative
+          -        for title in buttons {
+          -            alert.addButton(withTitle: title)
+          -        }
+          -        configure?(alert)
                    self.prepareModalWindowPresentation()
-                   self.configureModalWindow(alert.window)
-          +
-          +        // Safety net: never let a result alert hold the modal loop forever. Input dialogs
-          +        // keep the default (nil) so users have unlimited time to type a URL.
-          +        if let seconds, seconds > 0 {
-          +            let token = ObjectIdentifier(alert.window)
-          +            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-          +                MainActor.assumeIsolated {
-          +                    guard let modal = NSApp.modalWindow, ObjectIdentifier(modal) == token else { return }
-          +                    NSApp.stopModal(withCode: NSApplication.ModalResponse.cancel)
-          +                }
-          +            }
-          +        }
-          +
-                   return alert.runModal()
+          -        self.configureModalWindow(alert.window)
+          -        return alert.runModal()
+          +        return await AlertWindowController.shared.present(
+          +            style: style,
+          +            message: message,
+          +            informative: informative,
+          +            buttons: buttons,
+          +            accessory: accessory,
+          +            level: Self.alertWindowLevel,
+          +            autoDismissAfter: seconds)
                }
            }
+           
+          @@ -52,11 +72,13 @@
+                   self.lastCoreFailureAlertKey = dedupeKey
+                   self.lastCoreFailureAlertAt = now
+           
+          -        self.runModalAlert(
+          -            style: style,
+          -            message: title,
+          -            informative: message,
+          -            buttons: [tr("ui.action.ok")])
+          +        Task { [weak self] in
+          +            _ = await self?.presentAlert(
+          +                style: style,
+          +                message: title,
+          +                informative: message,
+          +                buttons: [tr("ui.action.ok")])
+          +        }
+               }
+           
+               func presentConfigValidationFailedAlert(fileName: String, details: String) {
+          @@ -67,20 +89,25 @@
+                       informativeParts.append(tr("app.config.validation_failed.hint.geo"))
+                   }
+                   informativeParts.append(tr("app.config.validation_failed.hint.common"))
+          +        let informative = informativeParts.joined(separator: "\n\n")
+           
+          -        let response = self.runModalAlert(
+          -            style: .critical,
+          -            message: tr("app.config.validation_failed.title"),
+          -            informative: informativeParts.joined(separator: "\n\n"),
+          -            buttons: [tr("ui.action.ok"), tr("ui.action.copy_details")])
+          -        { alert in
+          -            alert.setScrollableDetails(trimmedDetails.isEmpty ? self.tr("ui.common.unknown") : trimmedDetails)
+          -        }
+          +        let detailsText = trimmedDetails.isEmpty ? self.tr("ui.common.unknown") : trimmedDetails
+          +        let accessory = Self.makeScrollableDetailsView(detailsText)
+           
+          -        if response == .alertSecondButtonReturn {
+          -            let pasteboard = NSPasteboard.general
+          -            pasteboard.clearContents()
+          -            pasteboard.setString(trimmedDetails, forType: .string)
+          +        Task { [weak self] in
+          +            guard let self else { return }
+          +            let response = await self.presentAlert(
+          +                style: .critical,
+          +                message: tr("app.config.validation_failed.title"),
+          +                informative: informative,
+          +                buttons: [tr("ui.action.ok"), tr("ui.action.copy_details")],
+          +                accessory: accessory)
+          +
+          +            if response == .alertSecondButtonReturn {
+          +                let pasteboard = NSPasteboard.general
+          +                pasteboard.clearContents()
+          +                pasteboard.setString(trimmedDetails, forType: .string)
+          +            }
+                   }
+               }
+           
+          @@ -93,6 +120,42 @@
+                   return needles.contains { lower.contains($0) }
+               }
+           
+          +    private static func makeScrollableDetailsView(
+          +        _ text: String,
+          +        width: CGFloat = 440,
+          +        height: CGFloat = 200,
+          +        maxCharacters: Int = 20000) -> NSView
+          +    {
+          +        let clipped = text.count > maxCharacters
+          +            ? String(text.prefix(maxCharacters)) + "\n…"
+          +            : text
+          +
+          +        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+          +        scrollView.translatesAutoresizingMaskIntoConstraints = true
+          +        scrollView.hasVerticalScroller = true
+          +        scrollView.hasHorizontalScroller = false
+          +        scrollView.autohidesScrollers = true
+          +        scrollView.borderType = .bezelBorder
+          +        scrollView.drawsBackground = false
+          +
+          +        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+          +        textView.isEditable = false
+          +        textView.isSelectable = true
+          +        textView.drawsBackground = false
+          +        textView.isVerticallyResizable = true
+          +        textView.isHorizontallyResizable = false
+          +        textView.autoresizingMask = [.width]
+          +        textView.textContainerInset = NSSize(width: 4, height: 6)
+          +        textView.textContainer?.widthTracksTextView = true
+          +        textView.textContainer?.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+          +        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+          +        textView.textColor = .labelColor
+          +        textView.string = clipped
+          +
+          +        scrollView.documentView = textView
+          +        return scrollView
+          +    }
+          +
+               func presentInitialNoCoreSetupGuideIfNeeded() {
+                   guard self.shouldPresentInitialNoCoreSetupGuide() else { return }
+                   guard !didPresentInitialNoCoreSetupGuide else { return }
+          @@ -100,13 +163,20 @@
+                   didPresentInitialNoCoreSetupGuide = true
+                   defaults.set(true, forKey: initialNoCoreSetupGuideShownKey)
+           
+          -        let response = self.runModalAlert(
+          -            style: .informational,
+          -            message: tr("app.core.setup_required.title"),
+          -            informative: tr("app.core.setup_required.message", workingDirectoryManager.coreDirectoryURL.path),
+          -            buttons: [tr("ui.action.open_core_directory"), tr("ui.action.ok")])
+          -        if response == .alertFirstButtonReturn {
+          -            self.showCoreDirectoryInFinder()
+          +        let informative = tr(
+          +            "app.core.setup_required.message",
+          +            workingDirectoryManager.coreDirectoryURL.path)
+          +
+          +        Task { [weak self] in
+          +            guard let self else { return }
+          +            let response = await self.presentAlert(
+          +                style: .informational,
+          +                message: tr("app.core.setup_required.title"),
+          +                informative: informative,
+          +                buttons: [tr("ui.action.open_core_directory"), tr("ui.action.ok")])
+          +            if response == .alertFirstButtonReturn {
+          +                self.showCoreDirectoryInFinder()
+          +            }
+                   }
+               }
+           
+          @@ -116,3 +186,248 @@
+                   return true
+               }
+           }
+          +
+          +/// Owns the alert window and keeps the calling task suspended until the user answers.
+          +///
+          +/// Deliberately built on a plain `NSWindow` plus buttons instead of `NSAlert.runModal()`: there
+          +/// is no modal event loop, so a window that fails to appear can no longer freeze the app, and
+          +/// nothing can nest inside a stuck modal session.
+          +@MainActor
+          +final class AlertWindowController: NSObject {
+          +    static let shared = AlertWindowController()
+          +
+          +    private var window: NSWindow?
+          +    private var continuation: CheckedContinuation<NSApplication.ModalResponse, Never>?
+          +    private var autoDismissWorkItem: DispatchWorkItem?
+          +
+          +    func present(
+          +        style: NSAlert.Style,
+          +        message: String,
+          +        informative: String,
+          +        buttons: [String],
+          +        accessory: NSView?,
+          +        level: NSWindow.Level,
+          +        autoDismissAfter seconds: TimeInterval?) async -> NSApplication.ModalResponse
+          +    {
+          +        // Never stack alerts. A second request while one is visible returns immediately instead
+          +        // of opening another window on top of the first one.
+          +        guard self.window == nil else { return .abort }
+          +
+          +        return await withCheckedContinuation { (continuation: CheckedContinuation<
+          +            NSApplication.ModalResponse, Never>) in
+          +            self.continuation = continuation
+          +            self.showAlert(
+          +                style: style,
+          +                message: message,
+          +                informative: informative,
+          +                buttons: buttons,
+          +                accessory: accessory,
+          +                level: level,
+          +                autoDismissAfter: seconds)
+          +        }
+          +    }
+          +
+          +    private func showAlert(
+          +        style: NSAlert.Style,
+          +        message: String,
+          +        informative: String,
+          +        buttons: [String],
+          +        accessory: NSView?,
+          +        level: NSWindow.Level,
+          +        autoDismissAfter seconds: TimeInterval?)
+          +    {
+          +        let titles = buttons.isEmpty ? ["OK"] : buttons
+          +        let padding: CGFloat = 20
+          +        let iconSize: CGFloat = 40
+          +        let buttonsHeight: CGFloat = 26
+          +        let buttonsGap: CGFloat = 16
+          +        let accessoryGap: CGFloat = 14
+          +
+          +        // `fittingSize` is zero for a plain container that positions its children with frames
+          +        // instead of constraints (the import dialog does exactly that), so fall back to the
+          +        // view's own frame size in that case.
+          +        let accessorySize = Self.measuredSize(of: accessory)
+          +        let width: CGFloat = max(420, accessorySize.width + padding * 2 + 8)
+          +        let textLeft = padding + iconSize + 14
+          +        let textWidth = max(120, width - textLeft - padding)
+          +
+          +        let titleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+          +        let bodyFont = NSFont.systemFont(ofSize: 12, weight: .regular)
+          +        let titleHeight = Self.textHeight(message, font: titleFont, width: textWidth)
+          +        let bodyHeight = informative.isEmpty
+          +            ? 0
+          +            : Self.textHeight(informative, font: bodyFont, width: textWidth)
+          +        let bodyGap: CGFloat = bodyHeight > 0 ? 4 : 0
+          +
+          +        let accessoryHeight = accessorySize.height
+          +        let effectiveAccessoryGap: CGFloat = accessoryHeight > 0 ? accessoryGap : 0
+          +
+          +        let textBlockHeight = titleHeight + bodyGap + bodyHeight
+          +        let contentHeight = padding + max(iconSize, textBlockHeight)
+          +            + effectiveAccessoryGap + accessoryHeight
+          +            + buttonsGap + buttonsHeight + padding
+          +
+          +        let window = NSWindow(
+          +            contentRect: NSRect(x: 0, y: 0, width: width, height: contentHeight),
+          +            styleMask: [.titled, .closable],
+          +            backing: .buffered,
+          +            defer: false)
+          +        window.title = "ClashBar"
+          +        window.isReleasedWhenClosed = false
+          +        window.level = level
+          +        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+          +        window.hidesOnDeactivate = false
+          +
+          +        // Route the title-bar close button to our own handler so the pending continuation is
+          +        // always resumed; without this the window would close while a task waits forever.
+          +        if let closeButton = window.standardWindowButton(.closeButton) {
+          +            closeButton.target = self
+          +            closeButton.action = #selector(self.alertCloseButtonPressed(_:))
+          +        }
+          +
+          +        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: contentHeight))
+          +        content.autoresizingMask = [.width, .height]
+          +
+          +        let buttonsY = padding
+          +        let accessoryY = buttonsY + buttonsHeight + buttonsGap
+          +        let textBottom = accessoryY + accessoryHeight + effectiveAccessoryGap
+          +
+          +        let iconView = NSImageView(frame: NSRect(
+          +            x: padding,
+          +            y: contentHeight - padding - iconSize,
+          +            width: iconSize,
+          +            height: iconSize))
+          +        iconView.image = Self.icon(for: style)
+          +        iconView.imageScaling = .scaleProportionallyUpOrDown
+          +        content.addSubview(iconView)
+          +
+          +        if bodyHeight > 0 {
+          +            let bodyLabel = NSTextField(wrappingLabelWithString: informative)
+          +            bodyLabel.font = bodyFont
+          +            bodyLabel.textColor = .secondaryLabelColor
+          +            bodyLabel.isSelectable = false
+          +            bodyLabel.frame = NSRect(x: textLeft, y: textBottom, width: textWidth, height: bodyHeight)
+          +            content.addSubview(bodyLabel)
+          +        }
+          +
+          +        let titleLabel = NSTextField(wrappingLabelWithString: message)
+          +        titleLabel.font = titleFont
+          +        titleLabel.textColor = .labelColor
+          +        titleLabel.isSelectable = false
+          +        titleLabel.frame = NSRect(
+          +            x: textLeft,
+          +            y: textBottom + bodyHeight + bodyGap,
+          +            width: textWidth,
+          +            height: titleHeight)
+          +        content.addSubview(titleLabel)
+          +
+          +        if let accessory, accessoryHeight > 0 {
+          +            let accessoryWidth = min(width - padding * 2, max(accessorySize.width, 120))
+          +            accessory.frame = NSRect(
+          +                x: (width - accessoryWidth) / 2,
+          +                y: accessoryY,
+          +                width: accessoryWidth,
+          +                height: accessoryHeight)
+          +            content.addSubview(accessory)
+          +        }
+          +
+          +        var buttonX = width - padding
+          +        for (index, title) in titles.enumerated().reversed() {
+          +            let button = NSButton(title: title, target: self, action: #selector(self.alertButtonPressed(_:)))
+          +            button.tag = index
+          +            button.bezelStyle = .rounded
+          +            button.keyEquivalent = index == 0
+          +                ? "\r"
+          +                : (index == titles.count - 1 ? "\u{1b}" : "")
+          +            button.sizeToFit()
+          +            let buttonWidth = max(button.frame.width, 72)
+          +            button.frame = NSRect(
+          +                x: buttonX - buttonWidth,
+          +                y: buttonsY,
+          +                width: buttonWidth,
+          +                height: buttonsHeight)
+          +            buttonX -= buttonWidth + 10
+          +            content.addSubview(button)
+          +        }
+          +
+          +        window.contentView = content
+          +        window.center()
+          +
+          +        self.window = window
+          +        window.makeKeyAndOrderFront(nil)
+          +        window.orderFrontRegardless()
+          +
+          +        if let seconds, seconds > 0 {
+          +            let workItem = DispatchWorkItem { [weak self] in
+          +                MainActor.assumeIsolated {
+          +                    self?.finish(.abort)
+          +                }
+          +            }
+          +            self.autoDismissWorkItem = workItem
+          +            DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: workItem)
+          +        }
+          +
+          +        // If the window still is not on screen a moment later, give up instead of waiting for an
+          +        // answer that can never arrive.
+          +        let createdWindow = window
+          +        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+          +            MainActor.assumeIsolated {
+          +                guard let self, let current = self.window, current === createdWindow else { return }
+          +                guard !current.isVisible else { return }
+          +                self.finish(.abort)
+          +            }
+          +        }
+          +    }
+          +
+          +    @objc private func alertButtonPressed(_ sender: NSButton) {
+          +        let response = NSApplication.ModalResponse(
+          +            rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + sender.tag)
+          +        self.finish(response)
+          +    }
+          +
+          +    @objc private func alertCloseButtonPressed(_ sender: Any?) {
+          +        self.finish(.abort)
+          +    }
+          +
+          +    private func finish(_ response: NSApplication.ModalResponse) {
+          +        guard let window = self.window else { return }
+          +        self.window = nil
+          +
+          +        self.autoDismissWorkItem?.cancel()
+          +        self.autoDismissWorkItem = nil
+          +
+          +        window.orderOut(nil)
+          +
+          +        let continuation = self.continuation
+          +        self.continuation = nil
+          +        continuation?.resume(returning: response)
+          +    }
+          +
+          +    private static func measuredSize(of view: NSView?) -> NSSize {
+          +        guard let view else { return .zero }
+          +        let fitting = view.fittingSize
+          +        if fitting.width > 1, fitting.height > 1 {
+          +            return fitting
+          +        }
+          +        return view.frame.size
+          +    }
+          +
+          +    private static func icon(for style: NSAlert.Style) -> NSImage? {
+          +        switch style {
+          +        case .critical, .warning:
+          +            return NSImage(named: NSImage.cautionName)
+          +        default:
+          +            return NSApp.applicationIconImage
+          +        }
+          +    }
+          +
+          +    private static func textHeight(_ text: String, font: NSFont, width: CGFloat) -> CGFloat {
+          +        guard !text.isEmpty else { return 0 }
+          +        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+          +        let rect = (text as NSString).boundingRect(
+          +            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+          +            options: [.usesLineFragmentOrigin, .usesFontLeading],
+          +            attributes: attributes)
+          +        return ceil(rect.height) + 1
+          +    }
+          +}
           --- a/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
-          @@ -388,13 +388,16 @@
+          @@ -9,7 +9,7 @@
+           extension AppViewModel {
+               func importRemoteConfigFile() async {
+                   guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
+          -        guard let input = promptRemoteConfigImportInput() else { return }
+          +        guard let input = await promptRemoteConfigImportInput() else { return }
+           
+                   let urlText = input.urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+                   guard let remoteURL = URL(string: urlText), isSupportedRemoteConfigURL(remoteURL) else {
+          @@ -32,7 +32,7 @@
+                   let existingIsRemote = self.remoteConfigSubscriptions[fileName] != nil
+           
+                   if existsAlready, !existingIsRemote {
+          -            guard self.confirmOverwriteConfig(named: fileName) else {
+          +            guard await self.confirmOverwriteConfig(named: fileName) else {
+                           appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
+                           return
+                       }
+          @@ -136,7 +136,7 @@
+               }
+           
+               func deleteConfigFile(named fileName: String) async {
+          -        guard self.confirmDeleteConfig(named: fileName) else { return }
+          +        guard await self.confirmDeleteConfig(named: fileName) else { return }
+                   guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
+           
+                   let targetURL = configDirectory.appendingPathComponent(fileName, isDirectory: false)
+          @@ -178,8 +178,8 @@
+                   }
+               }
+           
+          -    private func confirmDeleteConfig(named fileName: String) -> Bool {
+          -        self.runModalAlert(
+          +    private func confirmDeleteConfig(named fileName: String) async -> Bool {
+          +        await self.presentAlert(
+                       style: .warning,
+                       message: tr("app.config.delete.title", fileName),
+                       informative: tr("app.config.delete.message"),
+          @@ -379,8 +379,8 @@
+                   try configService.writeConfigData(data, to: targetURL)
+               }
+           
+          -    func confirmOverwriteConfig(named fileName: String) -> Bool {
+          -        self.runModalAlert(
+          +    func confirmOverwriteConfig(named fileName: String) async -> Bool {
+          +        await self.presentAlert(
+                       style: .warning,
+                       message: tr("app.config.import.overwrite.title", fileName),
+                       informative: tr("app.config.import.overwrite.message"),
+          @@ -388,13 +388,21 @@
                }
            
                private func presentRemoteConfigImportResultAlert(success: Bool, message: String) {
-          +        // Result alerts are informational only. Cap the modal loop so a failed import
-          +        // can never leave the menu unresponsive if the alert is hidden or loses focus.
-                   self.runModalAlert(
-                       style: success ? .informational : .warning,
-                       message: success
-                           ? tr("app.config.remote_import.alert.success.title")
-                           : tr("app.config.remote_import.alert.failure.title"),
-                       informative: message,
+          -        self.runModalAlert(
+          -            style: success ? .informational : .warning,
+          -            message: success
+          -                ? tr("app.config.remote_import.alert.success.title")
+          -                : tr("app.config.remote_import.alert.failure.title"),
+          -            informative: message,
           -            buttons: [tr("ui.action.ok")])
-          +            buttons: [tr("ui.action.ok")],
-          +            autoDismissAfter: 20)
+          +        // Result alerts are informational only, so they are fire-and-forget with a cap: a failed
+          +        // import can never leave the menu unresponsive, and the window closes by itself.
+          +        let style: NSAlert.Style = success ? .informational : .warning
+          +        let title = success
+          +            ? tr("app.config.remote_import.alert.success.title")
+          +            : tr("app.config.remote_import.alert.failure.title")
+          +
+          +        Task { [weak self] in
+          +            _ = await self?.presentAlert(
+          +                style: style,
+          +                message: title,
+          +                informative: message,
+          +                buttons: [tr("ui.action.ok")],
+          +                autoDismissAfter: 20)
+          +        }
                }
            
                private struct RemoteConfigImportInput {
+          @@ -404,7 +412,7 @@
+                   let autoUpdateIntervalHours: Int
+               }
+           
+          -    private func promptRemoteConfigImportInput() -> RemoteConfigImportInput? {
+          +    private func promptRemoteConfigImportInput() async -> RemoteConfigImportInput? {
+                   let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 142))
+           
+                   let urlLabel = NSTextField(labelWithString: tr("ui.quick.remote.url_label"))
+          @@ -455,11 +463,12 @@
+                   container.addSubview(intervalField)
+                   container.addSubview(intervalUnit)
+           
+          -        let response = self.runModalAlert(
+          +        let response = await self.presentAlert(
+                       style: .informational,
+                       message: tr("ui.quick.import_remote_config"),
+                       informative: tr("app.config.remote_import.prompt"),
+          -            buttons: [tr("ui.action.import"), tr("ui.action.cancel")]) { $0.accessoryView = container }
+          +            buttons: [tr("ui.action.import"), tr("ui.action.cancel")],
+          +            accessory: container)
+                   guard response == .alertFirstButtonReturn else { return nil }
+           
+                   let autoUpdate = autoUpdateCheckbox.state == .on
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
+          @@ -102,7 +102,7 @@
+                   await restartCoreIfNeededForConfigSwitch(previousPath: previousSelectedPath, nextPath: nextSelectedPath)
+               }
+           
+          -    func importLocalConfigFile() {
+          +    func importLocalConfigFile() async {
+                   guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
+           
+                   self.prepareModalWindowPresentation()
+          @@ -132,9 +132,12 @@
+           
+                   let targetURL = configDirectory.appendingPathComponent(fileName, isDirectory: false)
+                   let isOverwrite = FileManager.default.fileExists(atPath: targetURL.path)
+          -        guard !isOverwrite || self.confirmOverwriteConfig(named: fileName) else {
+          -            appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
+          -            return
+          +        if isOverwrite {
+          +            let confirmed = await self.confirmOverwriteConfig(named: fileName)
+          +            guard confirmed else {
+          +                appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
+          +                return
+          +            }
+                   }
+           
+                   do {
+          --- a/Sources/ClashBar/Views/MenuBar/ProxyTabView.swift
+          +++ b/Sources/ClashBar/Views/MenuBar/ProxyTabView.swift
+          @@ -301,7 +301,7 @@
+                       leadingTint: self.nativePositive.opacity(T.Opacity.solid))
+                   {
+                       dismiss()
+          -            self.appViewModel.importLocalConfigFile()
+          +            Task { await self.appViewModel.importLocalConfigFile() }
+                   }
+                   AttachedPopoverMenuItem(
+                       title: self.tr("ui.quick.import_remote_config"),
           CLASHBAR_PATCH_EOF
           if git apply --check /tmp/clashbar-fix.patch 2>/dev/null; then
             git apply --verbose /tmp/clashbar-fix.patch
@@ -275,7 +801,7 @@ jobs:
         shell: bash
         env:
           APP_VERSION: 0.3.6
-          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched' }}
+          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched2' }}
         run: ./Scripts/build.sh dmg
 
       - name: Upload DMG

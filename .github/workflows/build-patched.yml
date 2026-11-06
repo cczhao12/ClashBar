@@ -4,8 +4,6 @@ name: Build patched ClashBar (arm64)
 # 故意没有 push 触发 —— 这样上传/覆盖本文件不会再产生额外 run，也不会打断正在跑的任务。
 # 定时：UTC 22:00 = 北京时间次日 06:00（GitHub cron 一律用 UTC，不认夏令时）。
 on:
-  schedule:
-    - cron: '0 22 * * *'
   workflow_dispatch:
     inputs:
       bundle_core:

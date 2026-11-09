@@ -1,8 +1,8 @@
 name: Build patched ClashBar (arm64)
 
-# 触发方式：定时 + 手动。
-# 故意没有 push 触发 —— 这样上传/覆盖本文件不会再产生额外 run，也不会打断正在跑的任务。
-# 定时：UTC 22:00 = 北京时间次日 06:00（GitHub cron 一律用 UTC，不认夏令时）。
+# 触发方式：仅手动（Actions 页 -> Run workflow）。
+# 没有 push 触发：上传/覆盖本文件不会产生额外 run，也不会打断正在跑的任务。
+# 没有 schedule：不自动定时构建，由你自行决定何时触发。
 on:
   workflow_dispatch:
     inputs:
@@ -17,7 +17,7 @@ on:
       dmg_suffix:
         description: 'Suffix used in the DMG filename'
         required: false
-        default: 'apple-silicon-patched4'
+        default: 'apple-silicon-patched5'
         type: string
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
           cat > /tmp/clashbar-fix.patch <<'CLASHBAR_PATCH_EOF'
           --- a/Sources/ClashBar/Services/ConfigService.swift
           +++ b/Sources/ClashBar/Services/ConfigService.swift
-          @@ -261,41 +261,112 @@
+          @@ -261,41 +261,112 @@ struct ConfigImportService {
                    return scheme == "http" || scheme == "https"
                }
            
@@ -67,13 +67,12 @@ jobs:
                        if !trimmed.isEmpty {
           -                request.setValue(trimmed, forHTTPHeaderField: "User-Agent")
           +                candidates.append(trimmed)
-                       }
-                   }
+          +            }
+          +        }
           +        for agent in Self.fallbackSubscriptionUserAgents where !candidates.contains(agent) {
           +            candidates.append(agent)
           +        }
-           
-          -        let (bytes, response) = try await session.bytes(for: request)
+          +
           +        var lastError: Error = NSError(
           +            domain: "ClashBar.ConfigImport",
           +            code: 500,
@@ -99,9 +98,10 @@ jobs:
           +                // The converter backend behind a subscription link is often rate limited or
           +                // still generating; give it a moment before the second round.
           +                try? await Task.sleep(nanoseconds: 2_000_000_000)
-          +            }
-          +        }
-          +
+                       }
+                   }
+           
+          -        let (bytes, response) = try await session.bytes(for: request)
           +        throw lastError
           +    }
           +
@@ -171,7 +171,7 @@ jobs:
                private func remoteConfigTooLargeError(limit: Int) -> NSError {
           --- a/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+Alerts.swift
-          @@ -3,33 +3,53 @@
+          @@ -3,33 +3,53 @@ import AppKit
            @MainActor
            extension AppViewModel {
                func prepareModalWindowPresentation() {
@@ -238,7 +238,7 @@ jobs:
                }
            }
            
-          @@ -52,11 +72,17 @@
+          @@ -52,11 +72,17 @@ extension AppViewModel {
                    self.lastCoreFailureAlertKey = dedupeKey
                    self.lastCoreFailureAlertAt = now
            
@@ -261,7 +261,7 @@ jobs:
                }
            
                func presentConfigValidationFailedAlert(fileName: String, details: String) {
-          @@ -67,20 +93,25 @@
+          @@ -67,20 +93,25 @@ extension AppViewModel {
                        informativeParts.append(tr("app.config.validation_failed.hint.geo"))
                    }
                    informativeParts.append(tr("app.config.validation_failed.hint.common"))
@@ -277,11 +277,7 @@ jobs:
           -        }
           +        let detailsText = trimmedDetails.isEmpty ? self.tr("ui.common.unknown") : trimmedDetails
           +        let accessory = Self.makeScrollableDetailsView(detailsText)
-           
-          -        if response == .alertSecondButtonReturn {
-          -            let pasteboard = NSPasteboard.general
-          -            pasteboard.clearContents()
-          -            pasteboard.setString(trimmedDetails, forType: .string)
+          +
           +        Task { [weak self] in
           +            guard let self else { return }
           +            let response = await self.presentAlert(
@@ -290,7 +286,11 @@ jobs:
           +                informative: informative,
           +                buttons: [tr("ui.action.ok"), tr("ui.action.copy_details")],
           +                accessory: accessory)
-          +
+           
+          -        if response == .alertSecondButtonReturn {
+          -            let pasteboard = NSPasteboard.general
+          -            pasteboard.clearContents()
+          -            pasteboard.setString(trimmedDetails, forType: .string)
           +            if response == .alertSecondButtonReturn {
           +                let pasteboard = NSPasteboard.general
           +                pasteboard.clearContents()
@@ -299,7 +299,7 @@ jobs:
                    }
                }
            
-          @@ -93,6 +124,42 @@
+          @@ -93,6 +124,42 @@ extension AppViewModel {
                    return needles.contains { lower.contains($0) }
                }
            
@@ -342,7 +342,7 @@ jobs:
                func presentInitialNoCoreSetupGuideIfNeeded() {
                    guard self.shouldPresentInitialNoCoreSetupGuide() else { return }
                    guard !didPresentInitialNoCoreSetupGuide else { return }
-          @@ -100,13 +167,20 @@
+          @@ -100,13 +167,20 @@ extension AppViewModel {
                    didPresentInitialNoCoreSetupGuide = true
                    defaults.set(true, forKey: initialNoCoreSetupGuideShownKey)
            
@@ -370,12 +370,10 @@ jobs:
                    }
                }
            
-          @@ -114,5 +188,281 @@
-                   guard self.shouldDeferAutoStartForMissingManagedCore() else { return false }
-                   guard !defaults.bool(forKey: initialNoCoreSetupGuideShownKey) else { return false }
+          @@ -116,3 +190,279 @@ extension AppViewModel {
                    return true
-          +    }
-          +}
+               }
+           }
           +
           +/// The window used for alerts.
           +///
@@ -593,7 +591,7 @@ jobs:
           +                self.finish(.abort)
           +            }
           +        }
-               }
+          +    }
           +
           +    @objc private func alertButtonPressed(_ sender: NSButton) {
           +        let response = NSApplication.ModalResponse(
@@ -651,10 +649,109 @@ jobs:
           +            attributes: attributes)
           +        return ceil(rect.height) + 1
           +    }
+          +}
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+Initialization.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+Initialization.swift
+          @@ -72,6 +72,7 @@ extension AppViewModel {
+                   self.replaceSystemProxyExceptionsDraft(with: persistedSystemProxyExceptions)
+                   self.lastSavedSystemProxyExceptions = self.normalizedSystemProxyExceptionValues(persistedSystemProxyExceptions)
+           
+          +        self.restorePersistedSystemProxyState()
+                   self.startupRefreshTask = Task { [weak self] in
+                       guard let self else { return }
+                       await self.refreshFromAPI(includeSlowCalls: true)
+          @@ -81,6 +82,7 @@ extension AppViewModel {
+                           await self.refreshSystemProxyHelperStatus()
+                           await self.refreshSystemProxyStatus()
+                           await self.ensureSystemProxyConsistencyOnFirstLaunchIfNeeded()
+          +                await self.restoreCoreFeaturesAfterStartupIfNeeded()
+                       } else {
+                           self.resetSystemProxyObservedState()
+                           self.didCheckSystemProxyConsistencyOnLaunch = true
+          @@ -100,6 +102,19 @@ extension AppViewModel {
+                   self.updateNetworkReachabilityMonitoringState()
+                   self.refreshMenuBarDisplaySnapshotIfNeeded()
+               }
+          +
+          +    /// Restore the last user-chosen system-proxy switch state at launch.
+          +    /// The persisted key is written as soon as the switch is flipped, so it survives
+          +    /// force-quit and crash, unlike the legacy one-shot enabled_on_quit key.
+          +    func restorePersistedSystemProxyState() {
+          +        guard self.defaults.bool(forKey: self.systemProxyEnabledPersistedKey) else { return }
+          +        self.isSystemProxyEnabled = true
+          +        if self.pendingCoreFeatureRecoveryState == nil {
+          +            self.pendingCoreFeatureRecoveryState = CoreFeatureRecoveryState(
+          +                systemProxyEnabled: true,
+          +                tunEnabled: false)
+          +        }
+          +    }
            }
+           
+           extension AppViewModel {
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+Lifecycle.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+Lifecycle.swift
+          @@ -234,6 +234,7 @@ extension AppViewModel {
+           
+               private func prepareForTermination() {
+                   self.defaults.set(self.isSystemProxyEnabled, forKey: self.systemProxyEnabledOnQuitKey)
+          +        self.defaults.set(self.isSystemProxyEnabled, forKey: self.systemProxyEnabledPersistedKey)
+                   self.cancelOwnedTasks()
+                   self.flushPendingMihomoLogsIfNeeded()
+                   self.clashbarLogStore?.flush()
+          @@ -436,8 +437,11 @@ extension AppViewModel {
+           
+               func seedCoreFeatureRecoveryFromPersistedQuitState() {
+                   let wasSystemProxyEnabled = defaults.bool(forKey: systemProxyEnabledOnQuitKey)
+          +            || defaults.bool(forKey: systemProxyEnabledPersistedKey)
+                   defaults.removeObject(forKey: systemProxyEnabledOnQuitKey)
+                   guard wasSystemProxyEnabled else { return }
+          +        // Migrate installs upgraded from older builds onto the persistent key.
+          +        defaults.set(true, forKey: systemProxyEnabledPersistedKey)
+                   guard pendingCoreFeatureRecoveryState == nil else { return }
+                   pendingCoreFeatureRecoveryState = CoreFeatureRecoveryState(
+                       systemProxyEnabled: true,
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
+          @@ -102,7 +102,7 @@ extension AppViewModel {
+                   await restartCoreIfNeededForConfigSwitch(previousPath: previousSelectedPath, nextPath: nextSelectedPath)
+               }
+           
+          -    func importLocalConfigFile() {
+          +    func importLocalConfigFile() async {
+                   guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
+           
+                   self.prepareModalWindowPresentation()
+          @@ -132,9 +132,12 @@ extension AppViewModel {
+           
+                   let targetURL = configDirectory.appendingPathComponent(fileName, isDirectory: false)
+                   let isOverwrite = FileManager.default.fileExists(atPath: targetURL.path)
+          -        guard !isOverwrite || self.confirmOverwriteConfig(named: fileName) else {
+          -            appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
+          -            return
+          +        if isOverwrite {
+          +            let confirmed = await self.confirmOverwriteConfig(named: fileName)
+          +            guard confirmed else {
+          +                appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
+          +                return
+          +            }
+                   }
+           
+                   do {
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+Proxy.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+Proxy.swift
+          @@ -50,6 +50,9 @@ extension AppViewModel {
+                           .requestNoResponse(.patchConfigs(body: ["mode": .string(currentMode.rawValue)]))
+           
+                       isSystemProxyEnabled = enabled
+          +            // Write the user's choice immediately instead of waiting for a termination
+          +            // callback: force-quit, SIGTERM and crashes never call applicationWillTerminate.
+          +            self.defaults.set(enabled, forKey: self.systemProxyEnabledPersistedKey)
+                       self.clearSystemProxyOpenFailureHint()
+                       self.systemProxyHelperFailureReason = nil
+                       self.systemProxyHelperFailureMessage = nil
           --- a/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+RemoteConfig.swift
-          @@ -9,7 +9,7 @@
+          @@ -9,7 +9,7 @@ private typealias T = MenuBarLayoutTokens
            extension AppViewModel {
                func importRemoteConfigFile() async {
                    guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
@@ -663,7 +760,7 @@ jobs:
            
                    let urlText = input.urlString.trimmingCharacters(in: .whitespacesAndNewlines)
                    guard let remoteURL = URL(string: urlText), isSupportedRemoteConfigURL(remoteURL) else {
-          @@ -32,7 +32,7 @@
+          @@ -32,7 +32,7 @@ extension AppViewModel {
                    let existingIsRemote = self.remoteConfigSubscriptions[fileName] != nil
            
                    if existsAlready, !existingIsRemote {
@@ -672,7 +769,7 @@ jobs:
                            appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
                            return
                        }
-          @@ -136,7 +136,7 @@
+          @@ -136,7 +136,7 @@ extension AppViewModel {
                }
            
                func deleteConfigFile(named fileName: String) async {
@@ -681,7 +778,7 @@ jobs:
                    guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
            
                    let targetURL = configDirectory.appendingPathComponent(fileName, isDirectory: false)
-          @@ -178,8 +178,8 @@
+          @@ -178,8 +178,8 @@ extension AppViewModel {
                    }
                }
            
@@ -692,7 +789,7 @@ jobs:
                        style: .warning,
                        message: tr("app.config.delete.title", fileName),
                        informative: tr("app.config.delete.message"),
-          @@ -379,8 +379,8 @@
+          @@ -379,8 +379,8 @@ extension AppViewModel {
                    try configService.writeConfigData(data, to: targetURL)
                }
            
@@ -703,7 +800,7 @@ jobs:
                        style: .warning,
                        message: tr("app.config.import.overwrite.title", fileName),
                        informative: tr("app.config.import.overwrite.message"),
-          @@ -388,13 +388,24 @@
+          @@ -388,13 +388,24 @@ extension AppViewModel {
                }
            
                private func presentRemoteConfigImportResultAlert(success: Bool, message: String) {
@@ -735,7 +832,7 @@ jobs:
                }
            
                private struct RemoteConfigImportInput {
-          @@ -404,7 +415,7 @@
+          @@ -404,7 +415,7 @@ extension AppViewModel {
                    let autoUpdateIntervalHours: Int
                }
            
@@ -744,7 +841,7 @@ jobs:
                    let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 142))
            
                    let urlLabel = NSTextField(labelWithString: tr("ui.quick.remote.url_label"))
-          @@ -455,11 +466,12 @@
+          @@ -455,11 +466,12 @@ extension AppViewModel {
                    container.addSubview(intervalField)
                    container.addSubview(intervalUnit)
            
@@ -759,36 +856,29 @@ jobs:
                    guard response == .alertFirstButtonReturn else { return nil }
            
                    let autoUpdate = autoUpdateCheckbox.state == .on
-          --- a/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
-          +++ b/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
-          @@ -102,7 +102,7 @@
-                   await restartCoreIfNeededForConfigSwitch(previousPath: previousSelectedPath, nextPath: nextSelectedPath)
+          --- a/Sources/ClashBar/ViewModels/AppViewModel+SystemProxy.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel+SystemProxy.swift
+          @@ -111,6 +111,7 @@ extension AppViewModel {
+                       || self.systemProxyEnableIntentInFlight
+                       || (self.pendingCoreFeatureRecoveryState?.systemProxyEnabled ?? false)
+                       || self.defaults.bool(forKey: self.systemProxyEnabledOnQuitKey)
+          +            || self.defaults.bool(forKey: self.systemProxyEnabledPersistedKey)
                }
            
-          -    func importLocalConfigFile() {
-          +    func importLocalConfigFile() async {
-                   guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
-           
-                   self.prepareModalWindowPresentation()
-          @@ -132,9 +132,12 @@
-           
-                   let targetURL = configDirectory.appendingPathComponent(fileName, isDirectory: false)
-                   let isOverwrite = FileManager.default.fileExists(atPath: targetURL.path)
-          -        guard !isOverwrite || self.confirmOverwriteConfig(named: fileName) else {
-          -            appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
-          -            return
-          +        if isOverwrite {
-          +            let confirmed = await self.confirmOverwriteConfig(named: fileName)
-          +            guard confirmed else {
-          +                appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
-          +                return
-          +            }
-                   }
-           
-                   do {
+               func resetSystemProxyObservedState() {
+          --- a/Sources/ClashBar/ViewModels/AppViewModel.swift
+          +++ b/Sources/ClashBar/ViewModels/AppViewModel.swift
+          @@ -413,6 +413,7 @@ final class AppViewModel: ObservableObject {
+               let lastSuccessfulConfigPathKey = "clashbar.last.success.config.path"
+               let editableSettingsSnapshotKey = "clashbar.settings.editable.snapshot.v1"
+               let systemProxyEnabledOnQuitKey = "clashbar.system_proxy.enabled_on_quit"
+          +    let systemProxyEnabledPersistedKey = "clashbar.system_proxy.enabled_persisted"
+               let systemProxyExceptionsKey = "clashbar.system_proxy.exceptions.v1"
+               let tunStackKey = "clashbar.tun.stack"
+               let ssidStrategyRulesKey = "clashbar.ssid.strategy.rules.v1"
           --- a/Sources/ClashBar/Views/MenuBar/ProxyTabView.swift
           +++ b/Sources/ClashBar/Views/MenuBar/ProxyTabView.swift
-          @@ -301,7 +301,7 @@
+          @@ -301,7 +301,7 @@ struct ProxyTabView: TranslatingView {
                        leadingTint: self.nativePositive.opacity(T.Opacity.solid))
                    {
                        dismiss()
@@ -839,7 +929,7 @@ jobs:
         shell: bash
         env:
           APP_VERSION: 0.3.6
-          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched4' }}
+          DMG_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.dmg_suffix || 'apple-silicon-patched5' }}
         run: ./Scripts/build.sh dmg
 
       - name: Upload DMG

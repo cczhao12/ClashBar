@@ -660,22 +660,27 @@ jobs:
                    self.startupRefreshTask = Task { [weak self] in
                        guard let self else { return }
                        await self.refreshFromAPI(includeSlowCalls: true)
-          @@ -81,6 +82,7 @@ extension AppViewModel {
+          @@ -80,7 +81,11 @@ extension AppViewModel {
+                       if self.hasSystemProxyOpenIntent {
                            await self.refreshSystemProxyHelperStatus()
                            await self.refreshSystemProxyStatus()
+          +                // The OS proxy is off after Stop; refreshSystemProxyStatus would flip
+          +                // the switch back to off. Re-apply the user's intent before restoring.
+          +                self.restorePersistedSystemProxyState()
                            await self.ensureSystemProxyConsistencyOnFirstLaunchIfNeeded()
           +                await self.restoreCoreFeaturesAfterStartupIfNeeded()
                        } else {
                            self.resetSystemProxyObservedState()
                            self.didCheckSystemProxyConsistencyOnLaunch = true
-          @@ -100,6 +102,19 @@ extension AppViewModel {
+          @@ -100,6 +105,20 @@ extension AppViewModel {
                    self.updateNetworkReachabilityMonitoringState()
                    self.refreshMenuBarDisplaySnapshotIfNeeded()
                }
           +
-          +    /// Restore the last user-chosen system-proxy switch state at launch.
-          +    /// The persisted key is written as soon as the switch is flipped, so it survives
-          +    /// force-quit and crash, unlike the legacy one-shot enabled_on_quit key.
+          +    /// Restore the user's last explicit system-proxy choice on launch.
+          +    /// The key is written only by toggleSystemProxy, so pausing (Stop) before quit
+          +    /// does not erase it. Pending recovery makes the auto-started core re-apply the
+          +    /// actual macOS proxy settings once it is running.
           +    func restorePersistedSystemProxyState() {
           +        guard self.defaults.bool(forKey: self.systemProxyEnabledPersistedKey) else { return }
           +        self.isSystemProxyEnabled = true
@@ -690,26 +695,34 @@ jobs:
            extension AppViewModel {
           --- a/Sources/ClashBar/ViewModels/AppViewModel+Lifecycle.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+Lifecycle.swift
-          @@ -234,6 +234,7 @@ extension AppViewModel {
+          @@ -233,6 +233,9 @@ extension AppViewModel {
+               }
            
                private func prepareForTermination() {
+          +        // Legacy one-shot key records the transient runtime state. It is deliberately
+          +        // not used to restore the switch: after Stop, isSystemProxyEnabled is false.
+          +        // The persisted user intent is written only by toggleSystemProxy.
                    self.defaults.set(self.isSystemProxyEnabled, forKey: self.systemProxyEnabledOnQuitKey)
-          +        self.defaults.set(self.isSystemProxyEnabled, forKey: self.systemProxyEnabledPersistedKey)
                    self.cancelOwnedTasks()
                    self.flushPendingMihomoLogsIfNeeded()
-                   self.clashbarLogStore?.flush()
-          @@ -436,8 +437,11 @@ extension AppViewModel {
+          @@ -435,13 +438,11 @@ extension AppViewModel {
+               }
            
                func seedCoreFeatureRecoveryFromPersistedQuitState() {
-                   let wasSystemProxyEnabled = defaults.bool(forKey: systemProxyEnabledOnQuitKey)
-          +            || defaults.bool(forKey: systemProxyEnabledPersistedKey)
+          -        let wasSystemProxyEnabled = defaults.bool(forKey: systemProxyEnabledOnQuitKey)
+          +        // The legacy key holds the state at quit time, which is false when the user
+          +        // paused (Stop) before quitting. Discard it and rebuild from the persisted
+          +        // user intent instead.
                    defaults.removeObject(forKey: systemProxyEnabledOnQuitKey)
-                   guard wasSystemProxyEnabled else { return }
-          +        // Migrate installs upgraded from older builds onto the persistent key.
-          +        defaults.set(true, forKey: systemProxyEnabledPersistedKey)
-                   guard pendingCoreFeatureRecoveryState == nil else { return }
-                   pendingCoreFeatureRecoveryState = CoreFeatureRecoveryState(
-                       systemProxyEnabled: true,
+          -        guard wasSystemProxyEnabled else { return }
+          -        guard pendingCoreFeatureRecoveryState == nil else { return }
+          -        pendingCoreFeatureRecoveryState = CoreFeatureRecoveryState(
+          -            systemProxyEnabled: true,
+          -            tunEnabled: false)
+          +        self.restorePersistedSystemProxyState()
+               }
+           
+               func restoreCoreFeaturesAfterStartupIfNeeded() async {
           --- a/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+LocalConfig.swift
           @@ -102,7 +102,7 @@ extension AppViewModel {
@@ -739,12 +752,13 @@ jobs:
                    do {
           --- a/Sources/ClashBar/ViewModels/AppViewModel+Proxy.swift
           +++ b/Sources/ClashBar/ViewModels/AppViewModel+Proxy.swift
-          @@ -50,6 +50,9 @@ extension AppViewModel {
+          @@ -50,6 +50,10 @@ extension AppViewModel {
                            .requestNoResponse(.patchConfigs(body: ["mode": .string(currentMode.rawValue)]))
            
                        isSystemProxyEnabled = enabled
-          +            // Write the user's choice immediately instead of waiting for a termination
-          +            // callback: force-quit, SIGTERM and crashes never call applicationWillTerminate.
+          +            // Record the user's explicit choice only here. Stop (pause) turns the
+          +            // system proxy off as a temporary, in-memory state, and quitting must
+          +            // not overwrite this key with that transient false value.
           +            self.defaults.set(enabled, forKey: self.systemProxyEnabledPersistedKey)
                        self.clearSystemProxyOpenFailureHint()
                        self.systemProxyHelperFailureReason = nil

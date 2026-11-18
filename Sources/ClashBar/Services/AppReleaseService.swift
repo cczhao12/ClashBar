@@ -6,7 +6,12 @@ enum AppReleaseServiceError: Error {
 }
 
 enum AppReleaseService {
-    private static let latestReleaseURL = URL(string: "https://api.github.com/repos/Sitoi/ClashBar/releases/latest")!
+    /// This fork, not upstream: a patched build must never be told to "update" to a release
+    /// that does not contain the fixes it is running.
+    static let repositorySlug = "cczhao12/ClashBar"
+
+    private static let latestReleaseURL = URL(
+        string: "https://api.github.com/repos/\(repositorySlug)/releases/latest")!
 
     static func fetchLatestRelease(currentVersion: String) async throws -> AppReleaseInfo {
         var request = URLRequest(url: Self.latestReleaseURL)

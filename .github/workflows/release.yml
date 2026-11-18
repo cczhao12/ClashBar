@@ -42,7 +42,7 @@ jobs:
       TARGET_ARCH: arm64
       DMG_SUFFIX: arm64
       # 固定内核版本，避免每次构建悄悄换掉 root helper 旁边跑的二进制。
-      MIHOMO_VERSION: v1.19.33
+      MIHOMO_VERSION: v1.19.34
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
       MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}

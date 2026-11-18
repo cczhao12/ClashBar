@@ -1,0 +1,213 @@
+name: Release
+
+# 单一发布入口。源码里已经包含全部定制修复，CI 不再打补丁、不再 checkout 上游。
+#
+#   push tag v*          -> 构建 -> 校验签名 -> 创建 GitHub Release（附 DMG）
+#   workflow_dispatch    -> 构建 -> 校验签名 -> 上传 artifact（不建 release）
+#
+# 签名是可选的：仓库里配好 MACOS_CERT_P12 / MACOS_CERT_PASSWORD /
+# MACOS_SIGNING_IDENTITY 就会用 Developer ID 签名，没配则退回 adhoc。
+# 详见 FORK.md。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'CFBundleShortVersionString，如 0.3.6；留空则从 tag 推导'
+        required: false
+        type: string
+      bundle_core:
+        description: '是否内嵌 mihomo 内核（0 = 更小的无内核包）'
+        required: false
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-arm64:
+    runs-on: macos-15-intel
+    env:
+      TARGET_ARCH: arm64
+      DMG_SUFFIX: arm64
+      # 固定内核版本，避免每次构建悄悄换掉 root helper 旁边跑的二进制。
+      MIHOMO_VERSION: v1.19.33
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          raw=""
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            raw="${GITHUB_REF_NAME}"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            raw="${INPUT_VERSION}"
+          else
+            raw="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.3.6)"
+          fi
+
+          version="${raw#v}"
+          version="${version%%-*}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "无法从 '${raw}' 推导出 x.y.z 版本号，请用 version 输入显式指定。" >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${version} (from '${raw}')"
+
+      - name: Validate signing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${MACOS_CERT_P12}" && -z "${MACOS_SIGNING_IDENTITY}" ]]; then
+            echo "已配置 MACOS_CERT_P12 但缺少 MACOS_SIGNING_IDENTITY，签名会被静默跳过。" >&2
+            exit 1
+          fi
+          if [[ -z "${MACOS_CERT_P12}" ]]; then
+            echo "::notice::未配置签名证书，本次产出为 adhoc 签名（仅限本机自用）。"
+          fi
+
+      - name: Import Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYCHAIN="${RUNNER_TEMP}/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          printf '%s' "$MACOS_CERT_P12" | openssl base64 -d -A -out "${RUNNER_TEMP}/cert.p12"
+          security import "${RUNNER_TEMP}/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
+          rm -f "${RUNNER_TEMP}/cert.p12"
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          echo "Signing identity: ${MACOS_SIGNING_IDENTITY}"
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Verify Swift toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+          if ! swift --version | grep -Eq 'Swift version (6\.[2-9]|[7-9]\.)'; then
+            echo "Swift 6.2+ is required by Package.swift." >&2
+            exit 1
+          fi
+
+      - name: Build app
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          PREPARE_MIHOMO_BINARY: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_core || '1' }}
+          BUNDLE_MIHOMO_BINARY: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_core || '1' }}
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: ./Scripts/build.sh app
+
+      - name: Verify signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="dist/ClashBar.app"
+          HELPER="${APP}/Contents/Library/HelperTools/com.clashbar.helper"
+
+          codesign --verify --strict --verbose=2 "$APP"
+          codesign --verify --strict --verbose=2 "$HELPER"
+
+          echo "--- app ---"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|Signature'
+          echo "--- helper ---"
+          codesign -dv --verbose=4 "$HELPER" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|Signature'
+
+          # 这条字符串决定 helper 是"认名字"还是"认 Apple 根证书"，必须在二进制里。
+          if ! strings "$HELPER" | grep -q 'anchor apple generic'; then
+            echo "helper 缺少 anchor apple generic 客户端校验。" >&2
+            exit 1
+          fi
+
+          team_app="$(codesign -dv --verbose=4 "$APP" 2>&1 | awk -F= '/TeamIdentifier/{print $2}')"
+          team_helper="$(codesign -dv --verbose=4 "$HELPER" 2>&1 | awk -F= '/TeamIdentifier/{print $2}')"
+          echo "TeamID app=${team_app} helper=${team_helper}"
+
+          if [[ -n "${MACOS_CERT_P12}" ]]; then
+            if [[ "${team_app}" != "${team_helper}" || "${team_app}" == "not set" ]]; then
+              echo "app 与 helper 的 Team ID 不一致或缺失，签名没有生效。" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Build DMG
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: ./Scripts/build.sh dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashBar-dmg
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          if-no-files-found: error
+
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClashBar-app
+          path: dist/ClashBar.app/
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists, uploading assets."
+            gh release upload "$TAG" dist/*.dmg dist/*.dmg.sha256 --clobber
+          else
+            gh release create "$TAG" dist/*.dmg dist/*.dmg.sha256 \
+              --title "$TAG" \
+              --generate-notes
+          fi

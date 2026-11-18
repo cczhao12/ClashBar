@@ -111,6 +111,7 @@ extension AppViewModel {
             || self.systemProxyEnableIntentInFlight
             || (self.pendingCoreFeatureRecoveryState?.systemProxyEnabled ?? false)
             || self.defaults.bool(forKey: self.systemProxyEnabledOnQuitKey)
+            || self.defaults.bool(forKey: self.systemProxyEnabledPersistedKey)
     }
 
     func resetSystemProxyObservedState() {

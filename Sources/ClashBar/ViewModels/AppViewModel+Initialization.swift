@@ -72,6 +72,7 @@ extension AppViewModel {
         self.replaceSystemProxyExceptionsDraft(with: persistedSystemProxyExceptions)
         self.lastSavedSystemProxyExceptions = self.normalizedSystemProxyExceptionValues(persistedSystemProxyExceptions)
 
+        self.restorePersistedSystemProxyState()
         self.startupRefreshTask = Task { [weak self] in
             guard let self else { return }
             await self.refreshFromAPI(includeSlowCalls: true)
@@ -80,7 +81,11 @@ extension AppViewModel {
             if self.hasSystemProxyOpenIntent {
                 await self.refreshSystemProxyHelperStatus()
                 await self.refreshSystemProxyStatus()
+                // The OS proxy is off after Stop; refreshSystemProxyStatus would flip
+                // the switch back to off. Re-apply the user's intent before restoring.
+                self.restorePersistedSystemProxyState()
                 await self.ensureSystemProxyConsistencyOnFirstLaunchIfNeeded()
+                await self.restoreCoreFeaturesAfterStartupIfNeeded()
             } else {
                 self.resetSystemProxyObservedState()
                 self.didCheckSystemProxyConsistencyOnLaunch = true
@@ -99,6 +104,20 @@ extension AppViewModel {
         self.refreshSSIDStrategyState(requestAuthorizationIfNeeded: self.ssidStrategyEnabled)
         self.updateNetworkReachabilityMonitoringState()
         self.refreshMenuBarDisplaySnapshotIfNeeded()
+    }
+
+    /// Restore the user's last explicit system-proxy choice on launch.
+    /// The key is written only by toggleSystemProxy, so pausing (Stop) before quit
+    /// does not erase it. Pending recovery makes the auto-started core re-apply the
+    /// actual macOS proxy settings once it is running.
+    func restorePersistedSystemProxyState() {
+        guard self.defaults.bool(forKey: self.systemProxyEnabledPersistedKey) else { return }
+        self.isSystemProxyEnabled = true
+        if self.pendingCoreFeatureRecoveryState == nil {
+            self.pendingCoreFeatureRecoveryState = CoreFeatureRecoveryState(
+                systemProxyEnabled: true,
+                tunEnabled: false)
+        }
     }
 }
 

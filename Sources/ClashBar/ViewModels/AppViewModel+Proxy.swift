@@ -50,6 +50,10 @@ extension AppViewModel {
                 .requestNoResponse(.patchConfigs(body: ["mode": .string(currentMode.rawValue)]))
 
             isSystemProxyEnabled = enabled
+            // Record the user's explicit choice only here. Stop (pause) turns the
+            // system proxy off as a temporary, in-memory state, and quitting must
+            // not overwrite this key with that transient false value.
+            self.defaults.set(enabled, forKey: self.systemProxyEnabledPersistedKey)
             self.clearSystemProxyOpenFailureHint()
             self.systemProxyHelperFailureReason = nil
             self.systemProxyHelperFailureMessage = nil

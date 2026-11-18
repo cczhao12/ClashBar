@@ -413,6 +413,7 @@ final class AppViewModel: ObservableObject {
     let lastSuccessfulConfigPathKey = "clashbar.last.success.config.path"
     let editableSettingsSnapshotKey = "clashbar.settings.editable.snapshot.v1"
     let systemProxyEnabledOnQuitKey = "clashbar.system_proxy.enabled_on_quit"
+    let systemProxyEnabledPersistedKey = "clashbar.system_proxy.enabled_persisted"
     let systemProxyExceptionsKey = "clashbar.system_proxy.exceptions.v1"
     let tunStackKey = "clashbar.tun.stack"
     let ssidStrategyRulesKey = "clashbar.ssid.strategy.rules.v1"

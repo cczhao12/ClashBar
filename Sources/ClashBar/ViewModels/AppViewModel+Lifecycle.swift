@@ -233,6 +233,9 @@ extension AppViewModel {
     }
 
     private func prepareForTermination() {
+        // Legacy one-shot key records the transient runtime state. It is deliberately
+        // not used to restore the switch: after Stop, isSystemProxyEnabled is false.
+        // The persisted user intent is written only by toggleSystemProxy.
         self.defaults.set(self.isSystemProxyEnabled, forKey: self.systemProxyEnabledOnQuitKey)
         self.cancelOwnedTasks()
         self.flushPendingMihomoLogsIfNeeded()
@@ -435,13 +438,11 @@ extension AppViewModel {
     }
 
     func seedCoreFeatureRecoveryFromPersistedQuitState() {
-        let wasSystemProxyEnabled = defaults.bool(forKey: systemProxyEnabledOnQuitKey)
+        // The legacy key holds the state at quit time, which is false when the user
+        // paused (Stop) before quitting. Discard it and rebuild from the persisted
+        // user intent instead.
         defaults.removeObject(forKey: systemProxyEnabledOnQuitKey)
-        guard wasSystemProxyEnabled else { return }
-        guard pendingCoreFeatureRecoveryState == nil else { return }
-        pendingCoreFeatureRecoveryState = CoreFeatureRecoveryState(
-            systemProxyEnabled: true,
-            tunEnabled: false)
+        self.restorePersistedSystemProxyState()
     }
 
     func restoreCoreFeaturesAfterStartupIfNeeded() async {

@@ -503,12 +503,77 @@ private final class ProxyHelperService: NSObject, ProxyHelperProtocol {
     }
 }
 
+/// 跟踪活跃 XPC 连接；连接归零后安静退出，避免一个 root 进程永久驻留。
+///
+/// launchd 的 `MachServices` 会在下一次 XPC 调用时按需把进程重新拉起来，所以
+/// plist 不需要 `KeepAlive`，退出也不影响功能——代价只是下次开启系统代理时多一次
+/// 几十毫秒的进程启动。
+private final class ProxyHelperIdleExitMonitor {
+    private let queue = DispatchQueue(label: "com.clashbar.helper.idle-exit")
+    private let idleTimeout: DispatchTimeInterval
+    private var activeTokens: Set<Int> = []
+    private var nextToken = 0
+    private var timer: DispatchSourceTimer?
+
+    init(idleTimeout: DispatchTimeInterval = .seconds(60)) {
+        self.idleTimeout = idleTimeout
+    }
+
+    /// 进程刚被拉起、还没有任何连接时，也应当具备"没人用就走"的能力。
+    func armInitialCountdown() {
+        self.queue.sync {
+            guard self.activeTokens.isEmpty else { return }
+            self.scheduleIdleExit()
+        }
+    }
+
+    func connectionOpened() -> Int {
+        self.queue.sync {
+            self.timer?.cancel()
+            self.timer = nil
+            self.nextToken += 1
+            let token = self.nextToken
+            self.activeTokens.insert(token)
+            return token
+        }
+    }
+
+    func connectionClosed(token: Int) {
+        self.queue.sync {
+            self.activeTokens.remove(token)
+            guard self.activeTokens.isEmpty else { return }
+            self.scheduleIdleExit()
+        }
+    }
+
+    private func scheduleIdleExit() {
+        self.timer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: self.queue)
+        timer.schedule(deadline: .now() + self.idleTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.activeTokens.isEmpty else { return }
+            exit(EXIT_SUCCESS)
+        }
+        timer.resume()
+        self.timer = timer
+    }
+}
+
 private final class ProxyHelperListenerDelegate: NSObject, NSXPCListenerDelegate {
     private let service = ProxyHelperService()
+    private let idleExitMonitor: ProxyHelperIdleExitMonitor
+
+    init(idleExitMonitor: ProxyHelperIdleExitMonitor) {
+        self.idleExitMonitor = idleExitMonitor
+    }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         newConnection.exportedInterface = NSXPCInterface(with: ProxyHelperProtocol.self)
         newConnection.exportedObject = self.service
+        let token = self.idleExitMonitor.connectionOpened()
+        newConnection.invalidationHandler = { [idleExitMonitor] in
+            idleExitMonitor.connectionClosed(token: token)
+        }
         newConnection.resume()
         return true
     }
@@ -517,11 +582,13 @@ private final class ProxyHelperListenerDelegate: NSObject, NSXPCListenerDelegate
 @main
 private struct ClashBarProxyHelperMain {
     static func main() {
-        let delegate = ProxyHelperListenerDelegate()
+        let idleExitMonitor = ProxyHelperIdleExitMonitor()
+        let delegate = ProxyHelperListenerDelegate(idleExitMonitor: idleExitMonitor)
         let listener = NSXPCListener(machServiceName: ProxyHelperConstants.machServiceName)
         listener.delegate = delegate
         listener.setConnectionCodeSigningRequirement(self.buildClientRequirement())
         listener.resume()
+        idleExitMonitor.armInitialCountdown()
         dispatchMain()
     }
 

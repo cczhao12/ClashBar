@@ -9,7 +9,8 @@ public enum ProxyHelperConstants {
     public static let installedPlistPath = "/Library/LaunchDaemons/com.clashbar.helper.plist"
     public static let installedVersionPath = "/Library/PrivilegedHelperTools/com.clashbar.helper.version"
     /// 3: 引入 anchor apple generic 客户端校验，旧 helper 必须被替换掉。
-    public static let helperVersion = 3
+    /// 4: helper 增加空闲退出（连接归零 60 秒后 exit），旧 helper 不会自己走。
+    public static let helperVersion = 4
     public static let allowedClientBundleIdentifier = "com.clashbar"
 
     /// Requirement used when the helper itself is adhoc-signed (local or unsigned builds).

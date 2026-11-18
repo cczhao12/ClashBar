@@ -416,3 +416,8 @@
 "app.config.delete.message" = "This will permanently delete the config file. If it is a remote subscription, the subscription metadata will also be removed.";
 "log.config.delete.success" = "Config deleted: %@";
 "log.config.delete.failed" = "Failed to delete config (%@): %@";
+
+"log.core.auto_restart.scheduled" = "Core exited unexpectedly, restarting in %ds (attempt %d/%d)";
+"log.core.auto_restart.cancelled" = "Cancelled pending core auto-restart: %@";
+"app.core.port_conflict.item" = "port %d is held by %@ (PID %d)";
+"app.core.port_conflict.hint" = "Port conflict detected: %@. Change the port in Settings → Ports, or quit the process holding it first.";

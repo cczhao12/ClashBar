@@ -17,7 +17,7 @@ extension AppViewModel {
         case restart
     }
 
-    func startCore(trigger: StartTrigger = .manual) async {
+    func startCore(trigger: StartTrigger = .manual, alertOnFailure: Bool = true) async {
         guard !self.isRemoteTarget else { return }
         guard !isCoreActionProcessing else { return }
         if trigger == .manual {
@@ -28,12 +28,15 @@ extension AppViewModel {
         var settingsOverlay = currentEditableSettingsSnapshot()
         settingsOverlay = self.overlayApplyingPendingCoreFeatureRecovery(settingsOverlay)
         preserveLocalSettingsOnNextSync = true
+        var launchingConfigPath: String?
         do {
             guard let configPath = await resolveSelectedConfigPath() else {
                 let message = tr("log.start.no_config")
-                self.reportCoreStartFailure(message: message, trigger: trigger, markFailedOnManual: false)
+                self.reportCoreStartFailure(
+                    message: message, trigger: trigger, markFailedOnManual: false, alert: alertOnFailure)
                 return
             }
+            launchingConfigPath = configPath
 
             settingsOverlay = try await prepareTunOverlayForCoreStartup(settingsOverlay)
 
@@ -65,19 +68,52 @@ extension AppViewModel {
                     refreshSystemProxyBeforeOverlay: true,
                     refreshSystemProxyAfterBootstrap: false,
                     autoTestGroupLatencies: true))
+
+            self.resetCoreAutoRestartState()
         } catch {
             preserveLocalSettingsOnNextSync = false
-            let message = tr("log.start.failed", self.coreErrorMessage(error))
-            self.reportCoreStartFailure(message: message, trigger: trigger, markFailedOnManual: true)
+            var message = tr("log.start.failed", self.coreErrorMessage(error))
+            if let hint = await self.describeStartupPortConflictHint(configPath: launchingConfigPath) {
+                message += "\n" + hint
+            }
+            self.reportCoreStartFailure(
+                message: message, trigger: trigger, markFailedOnManual: true, alert: alertOnFailure)
         }
     }
 
-    private func reportCoreStartFailure(message: String, trigger: StartTrigger, markFailedOnManual: Bool) {
+    /// 启动失败时补一条可读诊断：配置里声明的端口被谁占着。
+    private func describeStartupPortConflictHint(configPath: String?) async -> String? {
+        let path: String
+        if let configPath, !configPath.isEmpty {
+            path = configPath
+        } else if let resolved = await self.resolveSelectedConfigPath() {
+            path = resolved
+        } else {
+            return nil
+        }
+        let conflicts = await Task.detached(priority: .utility) {
+            CoreStartupDiagnostics.portConflicts(configPath: path)
+        }.value
+        guard !conflicts.isEmpty else { return nil }
+        let detail = conflicts
+            .map { tr("app.core.port_conflict.item", Int32($0.port), $0.processName, $0.pid) }
+            .joined(separator: "；")
+        return tr("app.core.port_conflict.hint", detail)
+    }
+
+    private func reportCoreStartFailure(
+        message: String,
+        trigger: StartTrigger,
+        markFailedOnManual: Bool,
+        alert: Bool = true)
+    {
         self.appendLog(level: "error", message: message)
-        self.presentCoreFailureAlert(
-            title: self.tr("app.core.alert.start_failed.title"),
-            message: message,
-            dedupeKey: "core-start-failed")
+        if alert {
+            self.presentCoreFailureAlert(
+                title: self.tr("app.core.alert.start_failed.title"),
+                message: message,
+                dedupeKey: "core-start-failed")
+        }
         if trigger == .auto {
             self.startupErrorMessage = message
             self.statusText = "Stopped"
@@ -88,12 +124,85 @@ extension AppViewModel {
         }
     }
 
+    /// 内核在非主动停止的情况下退出（崩溃、被 kill、OOM）。先按退避重试，
+    /// 用完配额才提示用户——否则人不在电脑前时代理会一直断着。
+    func handleUnexpectedCoreTermination(code: Int32) {
+        let message = tr("log.process.terminated", code)
+        statusText = "Failed"
+        apiStatus = .failed
+        resetTrafficPresentation()
+        appendLog(level: "error", message: message)
+        cancelPolling()
+
+        guard self.shouldAutoRestartCore() else {
+            if coreActionState == .idle {
+                presentCoreFailureAlert(
+                    title: tr("app.core.alert.process_terminated.title"),
+                    message: message,
+                    dedupeKey: "core-process-terminated",
+                    style: .critical)
+            }
+            return
+        }
+
+        let attempt = coreAutoRestartAttempt + 1
+        coreAutoRestartAttempt = attempt
+        if coreAutoRestartWindowStart == nil {
+            coreAutoRestartWindowStart = Date()
+        }
+        let index = min(attempt - 1, coreAutoRestartBackoffSeconds.count - 1)
+        let delay = coreAutoRestartBackoffSeconds[index]
+        appendLog(
+            level: "warning",
+            message: tr(
+                "log.core.auto_restart.scheduled",
+                Int32(clamping: Int64(delay)),
+                Int32(attempt),
+                Int32(coreAutoRestartMaxAttempts)))
+
+        coreAutoRestartTask?.cancel()
+        coreAutoRestartTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            guard !self.isPreparingForTermination else { return }
+            // 最后一次尝试失败才弹窗，避免连续三次告警糊住屏幕。
+            await self.startCore(
+                trigger: .auto,
+                alertOnFailure: attempt >= self.coreAutoRestartMaxAttempts)
+        }
+    }
+
+    private func shouldAutoRestartCore() -> Bool {
+        if self.isPreparingForTermination || self.isRemoteTarget {
+            return false
+        }
+        if let start = coreAutoRestartWindowStart, Date().timeIntervalSince(start) > coreAutoRestartWindow {
+            self.resetCoreAutoRestartState()
+        }
+        return coreAutoRestartAttempt < coreAutoRestartMaxAttempts
+    }
+
+    private func resetCoreAutoRestartState() {
+        coreAutoRestartAttempt = 0
+        coreAutoRestartWindowStart = nil
+    }
+
+    func cancelPendingCoreAutoRestart(reason: String) {
+        guard coreAutoRestartTask != nil else { return }
+        coreAutoRestartTask?.cancel()
+        coreAutoRestartTask = nil
+        self.appendLog(level: "info", message: tr("log.core.auto_restart.cancelled", reason))
+    }
+
     func stopCore(trigger: StopTrigger = .manual) async {
         guard !self.isRemoteTarget else { return }
         guard !isCoreActionProcessing else { return }
         if trigger == .manual {
             shouldResumeCoreAfterNetworkRecovery = false
         }
+        // 用户显式 Stop 时，任何排队中的自动重启都必须失效，否则停了又自己起来。
+        self.cancelPendingCoreAutoRestart(reason: "stop requested")
+        self.resetCoreAutoRestartState()
         let recoverySnapshotBeforeStop = self.currentCoreFeatureRecoverySnapshot()
         coreActionState = .stopping
         defer { coreActionState = .idle }
@@ -202,6 +311,7 @@ extension AppViewModel {
 
     func cancelOwnedTasks() {
         self.shouldResumeCoreAfterNetworkRecovery = false
+        self.cancelPendingCoreAutoRestart(reason: "owned tasks cancelled")
         self.stopNetworkReachabilityMonitoring()
         self.stopConfigDirectoryMonitoring()
         self.cancelDeferredEditableSettingsOverlaySync()
@@ -233,6 +343,9 @@ extension AppViewModel {
     }
 
     private func prepareForTermination() {
+        // 退出流程开始后，内核被关掉属于正常行为，不能触发自动重启。
+        self.isPreparingForTermination = true
+        self.cancelPendingCoreAutoRestart(reason: "app terminating")
         // Legacy one-shot key records the transient runtime state. It is deliberately
         // not used to restore the switch: after Stop, isSystemProxyEnabled is false.
         // The persisted user intent is written only by toggleSystemProxy.

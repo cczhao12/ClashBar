@@ -450,6 +450,15 @@ final class AppViewModel: ObservableObject {
     let coreFailureAlertThrottleInterval: TimeInterval = 20
     var networkReachabilityStatus: NetworkReachabilityStatus = .unknown
     var shouldResumeCoreAfterNetworkRecovery = false
+    /// 内核异常退出后的自动重启状态。次数与时间窗双重限制，避免配置错误导致无限重启。
+    var coreAutoRestartAttempt = 0
+    var coreAutoRestartWindowStart: Date?
+    var coreAutoRestartTask: Task<Void, Never>?
+    let coreAutoRestartMaxAttempts = 3
+    let coreAutoRestartWindow: TimeInterval = 600
+    let coreAutoRestartBackoffSeconds: [UInt64] = [2, 6, 15]
+    /// 退出流程已经启动，此时不应把内核退出当成崩溃去重启。
+    var isPreparingForTermination = false
     var isNetworkReachabilityMonitoring = false
     var isSSIDStrategyMonitoring = false
     var pendingCoreFeatureRecoveryState: CoreFeatureRecoveryState?

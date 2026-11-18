@@ -102,7 +102,7 @@ extension AppViewModel {
         await restartCoreIfNeededForConfigSwitch(previousPath: previousSelectedPath, nextPath: nextSelectedPath)
     }
 
-    func importLocalConfigFile() {
+    func importLocalConfigFile() async {
         guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
 
         self.prepareModalWindowPresentation()
@@ -132,9 +132,12 @@ extension AppViewModel {
 
         let targetURL = configDirectory.appendingPathComponent(fileName, isDirectory: false)
         let isOverwrite = FileManager.default.fileExists(atPath: targetURL.path)
-        guard !isOverwrite || self.confirmOverwriteConfig(named: fileName) else {
-            appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
-            return
+        if isOverwrite {
+            let confirmed = await self.confirmOverwriteConfig(named: fileName)
+            guard confirmed else {
+                appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
+                return
+            }
         }
 
         do {

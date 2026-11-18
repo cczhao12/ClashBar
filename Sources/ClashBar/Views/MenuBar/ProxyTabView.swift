@@ -301,7 +301,7 @@ struct ProxyTabView: TranslatingView {
             leadingTint: self.nativePositive.opacity(T.Opacity.solid))
         {
             dismiss()
-            self.appViewModel.importLocalConfigFile()
+            Task { await self.appViewModel.importLocalConfigFile() }
         }
         AttachedPopoverMenuItem(
             title: self.tr("ui.quick.import_remote_config"),

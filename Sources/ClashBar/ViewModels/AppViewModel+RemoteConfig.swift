@@ -9,7 +9,7 @@ private typealias T = MenuBarLayoutTokens
 extension AppViewModel {
     func importRemoteConfigFile() async {
         guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
-        guard let input = promptRemoteConfigImportInput() else { return }
+        guard let input = await promptRemoteConfigImportInput() else { return }
 
         let urlText = input.urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let remoteURL = URL(string: urlText), isSupportedRemoteConfigURL(remoteURL) else {
@@ -32,7 +32,7 @@ extension AppViewModel {
         let existingIsRemote = self.remoteConfigSubscriptions[fileName] != nil
 
         if existsAlready, !existingIsRemote {
-            guard self.confirmOverwriteConfig(named: fileName) else {
+            guard await self.confirmOverwriteConfig(named: fileName) else {
                 appendLog(level: "info", message: tr("log.config.import.cancelled", fileName))
                 return
             }
@@ -136,7 +136,7 @@ extension AppViewModel {
     }
 
     func deleteConfigFile(named fileName: String) async {
-        guard self.confirmDeleteConfig(named: fileName) else { return }
+        guard await self.confirmDeleteConfig(named: fileName) else { return }
         guard let configDirectory = ensureConfigDirectoryAvailable() else { return }
 
         let targetURL = configDirectory.appendingPathComponent(fileName, isDirectory: false)
@@ -178,8 +178,8 @@ extension AppViewModel {
         }
     }
 
-    private func confirmDeleteConfig(named fileName: String) -> Bool {
-        self.runModalAlert(
+    private func confirmDeleteConfig(named fileName: String) async -> Bool {
+        await self.presentAlert(
             style: .warning,
             message: tr("app.config.delete.title", fileName),
             informative: tr("app.config.delete.message"),
@@ -379,8 +379,8 @@ extension AppViewModel {
         try configService.writeConfigData(data, to: targetURL)
     }
 
-    func confirmOverwriteConfig(named fileName: String) -> Bool {
-        self.runModalAlert(
+    func confirmOverwriteConfig(named fileName: String) async -> Bool {
+        await self.presentAlert(
             style: .warning,
             message: tr("app.config.import.overwrite.title", fileName),
             informative: tr("app.config.import.overwrite.message"),
@@ -388,13 +388,24 @@ extension AppViewModel {
     }
 
     private func presentRemoteConfigImportResultAlert(success: Bool, message: String) {
-        self.runModalAlert(
-            style: success ? .informational : .warning,
-            message: success
-                ? tr("app.config.remote_import.alert.success.title")
-                : tr("app.config.remote_import.alert.failure.title"),
-            informative: message,
-            buttons: [tr("ui.action.ok")])
+        // Result alerts are informational only, so they are fire-and-forget with a cap: a failed
+        // import can never leave the menu unresponsive, and the window closes by itself.
+        let style: NSAlert.Style = success ? .informational : .warning
+        let title = success
+            ? tr("app.config.remote_import.alert.success.title")
+            : tr("app.config.remote_import.alert.failure.title")
+
+        // `self` is optional inside the task, so the localized title is resolved up front.
+        let okTitle = self.tr("ui.action.ok")
+
+        Task { [weak self] in
+            _ = await self?.presentAlert(
+                style: style,
+                message: title,
+                informative: message,
+                buttons: [okTitle],
+                autoDismissAfter: 20)
+        }
     }
 
     private struct RemoteConfigImportInput {
@@ -404,7 +415,7 @@ extension AppViewModel {
         let autoUpdateIntervalHours: Int
     }
 
-    private func promptRemoteConfigImportInput() -> RemoteConfigImportInput? {
+    private func promptRemoteConfigImportInput() async -> RemoteConfigImportInput? {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 142))
 
         let urlLabel = NSTextField(labelWithString: tr("ui.quick.remote.url_label"))
@@ -455,11 +466,12 @@ extension AppViewModel {
         container.addSubview(intervalField)
         container.addSubview(intervalUnit)
 
-        let response = self.runModalAlert(
+        let response = await self.presentAlert(
             style: .informational,
             message: tr("ui.quick.import_remote_config"),
             informative: tr("app.config.remote_import.prompt"),
-            buttons: [tr("ui.action.import"), tr("ui.action.cancel")]) { $0.accessoryView = container }
+            buttons: [tr("ui.action.import"), tr("ui.action.cancel")],
+            accessory: container)
         guard response == .alertFirstButtonReturn else { return nil }
 
         let autoUpdate = autoUpdateCheckbox.state == .on

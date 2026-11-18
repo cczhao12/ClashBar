@@ -526,11 +526,13 @@ private struct ClashBarProxyHelperMain {
     }
 
     private static func buildClientRequirement() -> String {
-        let base = ProxyHelperConstants.allowedClientRequirement
         guard let teamID = selfTeamIdentifier(), !teamID.isEmpty else {
-            return base
+            // Adhoc-signed helper (local build): an adhoc signature has no certificate chain,
+            // so there is nothing to anchor to and the identifier check stays as a fallback.
+            return ProxyHelperConstants.allowedClientRequirement
         }
-        return "\(base) and certificate leaf[subject.OU] = \"\(teamID)\""
+        // Developer ID build: anchor the client to Apple's root and to our own Team ID.
+        return ProxyHelperConstants.signedClientRequirement(teamID: teamID)
     }
 
     private static func selfTeamIdentifier() -> String? {
